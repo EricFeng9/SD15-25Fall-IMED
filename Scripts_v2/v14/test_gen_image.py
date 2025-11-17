@@ -76,14 +76,14 @@ from data_loader_all import (
 
 # ============ 配置变量（在程序开头指定）============
 # 1. 目标图片路径（待推理的图片目录）
-INPUT_IMAGE_DIR = "/data/student/Fengjunming/SDXL_ControlNet/data/CFFA_pureCF"
+INPUT_IMAGE_DIR = "/data/student/Fengjunming/SDXL_ControlNet/data/CF_251112"
 
 # 2. SD15模型和ControlNet模型路径（多模态）
 BASE_MODEL_DIR = "/data/student/Fengjunming/SDXL_ControlNet/models/sd15-diffusers"
 
 # CF2FA 模型
-CONTROLNET_SCRIBBLE_CF2FA = "/data/student/Fengjunming/SDXL_ControlNet/results/out_ctrl_sd15_dual/cf2fa/251109_4/best_checkpoint/controlnet_scribble"
-CONTROLNET_TILE_CF2FA = "/data/student/Fengjunming/SDXL_ControlNet/results/out_ctrl_sd15_dual/cf2fa/251109_4/best_checkpoint/controlnet_tile"
+CONTROLNET_SCRIBBLE_CF2FA = "/data/student/Fengjunming/SDXL_ControlNet/results/out_ctrl_sd15_dual/cf2fa/251109_5/best_checkpoint/controlnet_scribble"
+CONTROLNET_TILE_CF2FA = "/data/student/Fengjunming/SDXL_ControlNet/results/out_ctrl_sd15_dual/cf2fa/251109_5/best_checkpoint/controlnet_tile"
 
 # CF2OCT 模型
 CONTROLNET_SCRIBBLE_CF2OCT = "/data/student/Fengjunming/SDXL_ControlNet/results/out_ctrl_sd15_dual/cf2oct/251109_5/best_checkpoint/controlnet_scribble"
