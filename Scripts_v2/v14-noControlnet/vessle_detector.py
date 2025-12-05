@@ -218,7 +218,7 @@ if __name__ == "__main__":
   python vessle_detector.py --method hessian --fa
   
   # Hessian血管增强 - CF图像（彩色眼底照，血管是暗色，需要取反）
-  python vessle_detector.py --method hessian --cf --gamma 0.001
+  python vessle_detector.py --method hessian --cf --gamma 1
   
   # Hessian血管增强 - OCTA图像（血管是亮色）
   python vessle_detector.py --method hessian --octa
