@@ -1,20 +1,9 @@
 # -*- coding: utf-8 -*-
 '''
-训练脚本 - SD 1.5 + Dual ControlNet
+训练脚本 - SD 1.5 + 单路 Canny ControlNet（基于 v14 改造）
 
-【模型】Stable Diffusion 1.5 (512×512) + 双路 ControlNet (Scribble + Tile)
-【数据集】支持三种数据集：CF-OCTA, CF-FA, CF_OCT
-
-【核心特点】
-- 双路 ControlNet 架构：
-  * Scribble: 血管结构引导（Frangi 滤波血管图）
-  * Tile: 原图细节保留
-- 损失函数：MSE + MS-SSIM + Vessel Loss (Frangi + Dice) + Gradient Loss
-- 早停机制：验证损失连续8次未提升则停止
-- 【v14】有效区域筛选：使用 filter_valid_area 预处理，移除掩码逻辑
-
-【使用方法】
-python train.py --mode cf2fa --name exp_name --max_steps 8000 --scribble_scale 0.8 --vessel_lambda 0.05
+【模型】Stable Diffusion 1.5 (512×512) + 单路 Canny ControlNet
+【数据集】支持：CF-OCTA, CF-FA, CF_OCT
 '''
 
 import os
@@ -40,10 +29,10 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from pytorch_msssim import MS_SSIM  # 仅用于像素空间的MS-SSIM Loss，Vessel Loss已改用Dice
 import time
 import argparse
+import numpy as _np_tmp  # for canny helper
 
-# 导入统一数据加载器（v14：Scribble 输入改用 Frangi 滤波）
 from data_loader_all import (
-    UnifiedDataset, SIZE, generate_controlnet_inputs,
+    UnifiedDataset, SIZE,
     GAMMA_CFFA, GAMMA_CFOCTA_CF, GAMMA_CFOCTA_OCTA,  # Frangi参数
     GAMMA_CFOCT_CF, GAMMA_CFOCT_OCT, FRANGI_SIGMAS, FRANGI_ALPHA, FRANGI_BETA,
     extract_vessel_map_torch,  # PyTorch可微血管提取（训练/验证/推理共用）
@@ -57,10 +46,26 @@ from effective_area_regist_cut import filter_valid_area, register_image, read_po
 # v14: 导入统一推理接口
 from unified_inference import unified_inference
 
-# ============ SD 1.5 + Dual ControlNet 模型路径配置 ============
+# ============ Canny 生成工具 ============
+def make_canny_batch(cond_tile: torch.Tensor, low: int = 100, high: int = 200) -> torch.Tensor:
+    """
+    输入: cond_tile (B, 3, H, W) in [0,1] (float)
+    输出: canny (B, 3, H, W) in [0,1] float
+    """
+    cond_np = (cond_tile.detach().cpu().clamp(0, 1) * 255).byte().permute(0, 2, 3, 1).numpy()
+    outs = []
+    for img in cond_np:
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, low, high)
+        edges_3c = _np_tmp.stack([edges]*3, axis=-1)
+        outs.append(edges_3c)
+    outs = torch.from_numpy(_np_tmp.stack(outs)).float() / 255.0  # (B,H,W,3)
+    outs = outs.permute(0,3,1,2).to(cond_tile.device)
+    return outs
+
+# ============ SD 1.5 + Canny ControlNet 模型路径配置 ============
 base_dir = "/data/student/Fengjunming/SDXL_ControlNet/models/sd15-diffusers"
-ctrl_scribble_dir = "/data/student/Fengjunming/SDXL_ControlNet/models/controlnet-sd15-scribble"
-ctrl_tile_dir = "/data/student/Fengjunming/SDXL_ControlNet/models/controlnet-sd15-tile"
+ctrl_canny_dir = "/data/student/Fengjunming/SDXL_ControlNet/models/controlnet-sd15-canny"
 
 # CSV 数据路径配置（根据模式选择）
 CFOCTA_TRAIN_CSV = "/data/student/Fengjunming/SDXL_ControlNet/Scripts/train_pairs_v2-2_repaired.csv"
@@ -71,7 +76,7 @@ CFOCT_TRAIN_CSV = "/data/student/Fengjunming/SDXL_ControlNet/Scripts/train_pairs
 CFOCT_VAL_CSV   = "/data/student/Fengjunming/SDXL_ControlNet/Scripts/test_pairs_cfoct.csv"
 
 # 输出目录
-out_root  = "/data/student/Fengjunming/SDXL_ControlNet/results/out_ctrl_sd15_dual"
+out_root  = "/data/student/Fengjunming/SDXL_ControlNet/results/out_ctrl_sd15_canny"
 device    = torch.device("cuda")
 
 # CF-FA 原始图像尺寸
@@ -482,21 +487,16 @@ def run_inference_test(row_data, step_dir, step_num, mode, fixed_seed=42):
     idx = os.path.splitext(os.path.basename(src_path))[0]
     
     # ============【v14 统一推理接口】============
-    # 使用统一的推理接口处理所有数据集
+    # 使用统一的推理接口处理所有数据集（单路 Canny）
     try:
-        # 构建推理 pipeline（Dual ControlNet: Scribble + Tile）
-        controlnet_scribble.eval()
-        controlnet_tile.eval()
-        
-        from diffusers import MultiControlNetModel
-        multi_controlnet = MultiControlNetModel([controlnet_scribble, controlnet_tile])
+        controlnet_canny.eval()
         
         pipe = StableDiffusionControlNetPipeline(
             vae=vae,
             text_encoder=text_encoder,
             tokenizer=tokenizer,
             unet=unet,
-            controlnet=multi_controlnet,
+            controlnet=controlnet_canny,
             scheduler=noise_scheduler,
             safety_checker=None,
             feature_extractor=None
@@ -511,8 +511,7 @@ def run_inference_test(row_data, step_dir, step_num, mode, fixed_seed=42):
             cond_pts_path=cond_pts_path,
             tgt_pts_path=tgt_pts_path,
             affine_path=affine_path if is_cfocta else None,
-            scribble_scale=args.scribble_scale,
-            tile_scale=args.tile_scale,
+            canny_scale=args.canny_scale,
             cfg=7.5,
             steps=30,
             seed=fixed_seed,
@@ -521,14 +520,13 @@ def run_inference_test(row_data, step_dir, step_num, mode, fixed_seed=42):
         )
         
         # 提取结果
-        pred_img = results['pred']  # 512×512 预测图
-        cond_scribble_pil = results['scribble_input']  # 512×512 Scribble 输入
-        cond_tile_pil = results['tile_input']  # 512×512 Tile 输入
+        pred_img = results['pred']              # 512×512 预测图
+        cond_canny_pil = results['canny_input'] # 512×512 Canny 输入
         tgt_512_pil = results['tgt_processed']  # 512×512 处理后的目标图
-        chessboard_np = results['chessboard']  # 512×512 棋盘图
+        chessboard_np = results['chessboard']   # 512×512 棋盘图
         filtered_src_pil = results['filtered_cond']  # 筛选后的原尺寸条件图
-        filtered_tgt_pil = results['filtered_tgt']  # 筛选后的原尺寸目标图
-        filtered_size = results['filtered_size']  # 筛选后的尺寸
+        filtered_tgt_pil = results['filtered_tgt']   # 筛选后的原尺寸目标图
+        filtered_size = results['filtered_size']     # 筛选后的尺寸
         
         print(f"  ✓ 统一推理接口调用成功")
         
@@ -537,8 +535,7 @@ def run_inference_test(row_data, step_dir, step_num, mode, fixed_seed=42):
         import traceback
         traceback.print_exc()
         # 恢复训练模式
-        controlnet_scribble.train()
-        controlnet_tile.train()
+        controlnet_canny.train()
         return
     
     # ============ 保存推理结果 ============
@@ -547,26 +544,24 @@ def run_inference_test(row_data, step_dir, step_num, mode, fixed_seed=42):
     if filtered_src_pil is not None:
         filtered_src_pil.save(os.path.join(infer_dir, f"{idx}_01_input_filtered.png"))
     
-    # 2. 保存 Scribble 和 Tile 输入 (512×512)
-    cond_scribble_pil.save(os.path.join(infer_dir, f"{idx}_02_scribble_512x512.png"))
-    cond_tile_pil.save(os.path.join(infer_dir, f"{idx}_03_tile_512x512.png"))
+    # 2. 保存 Canny 输入 (512×512)
+    cond_canny_pil.save(os.path.join(infer_dir, f"{idx}_02_canny_512x512.png"))
     
     # 3. 保存 512×512 预测图
-    pred_img.save(os.path.join(infer_dir, f"{idx}_04_pred_512x512_step{step_num}.png"))
+    pred_img.save(os.path.join(infer_dir, f"{idx}_03_pred_512x512_step{step_num}.png"))
     
     # 4. 保存 512×512 目标图和棋盘图
-    tgt_512_pil.save(os.path.join(infer_dir, f"{idx}_05_target_512x512.png"))
-    Image.fromarray(chessboard_np).save(os.path.join(infer_dir, f"{idx}_06_chessboard_512x512_step{step_num}.png"))
+    tgt_512_pil.save(os.path.join(infer_dir, f"{idx}_04_target_512x512.png"))
+    Image.fromarray(chessboard_np).save(os.path.join(infer_dir, f"{idx}_05_chessboard_512x512_step{step_num}.png"))
     
     # 5. 如果是 CF-FA/CF-OCT，保存筛选后的原尺寸目标图
     if (is_cffa or is_cfoct) and filtered_tgt_pil is not None:
-        filtered_tgt_pil.save(os.path.join(infer_dir, f"{idx}_07_target_filtered.png"))
+        filtered_tgt_pil.save(os.path.join(infer_dir, f"{idx}_06_target_filtered.png"))
     
     print(f"✓ 推理测试完成: {infer_dir}\n")
     
     # 恢复训练模式
-    controlnet_scribble.train()
-    controlnet_tile.train()
+    controlnet_canny.train()
 
 
 def main():
@@ -587,11 +582,9 @@ def main():
     parser.add_argument("--max_steps", type=int, default=15000,
                         help="总训练步数")
     
-    # Dual ControlNet 强度参数
-    parser.add_argument("--scribble_scale", type=float, default=0.8,
-                        help="Scribble ControlNet 强度（推荐 0.6-1.0）")
-    parser.add_argument("--tile_scale", type=float, default=1.0,
-                        help="Tile ControlNet 强度（推荐 0.8-1.2）")
+    # Canny ControlNet 强度参数
+    parser.add_argument("--canny_scale", type=float, default=1.0,
+                        help="Canny ControlNet 强度（推荐 0.6-1.2）")
     parser.add_argument("--msssim_lambda", type=float, default=0.1,
                         help="MS-SSIM 感知损失的权重 (设为0则禁用)")
     parser.add_argument("--vessel_lambda", type=float, default=0.05,
@@ -702,10 +695,10 @@ def main():
     
     print(f"\n固定测试样本[{fixed_sample_idx}]: {os.path.basename(src_path)} → {os.path.basename(tgt_path)}")
 
-    # ============ SD 1.5 + Dual ControlNet 模型加载 ============
-    global vae, unet, text_encoder, tokenizer, controlnet_scribble, controlnet_tile, vae_sf, noise_scheduler
+    # ============ SD 1.5 + Canny ControlNet 模型加载 ============
+    global vae, unet, text_encoder, tokenizer, controlnet_canny, vae_sf, noise_scheduler
     
-    print(f"\n{'='*70}\n正在加载 SD 1.5 + Dual ControlNet...")
+    print(f"\n{'='*70}\n正在加载 SD 1.5 + Canny ControlNet...")
     
     resume_step = 0
     
@@ -726,30 +719,19 @@ def main():
             print(f"  → step {resume_step}")
         
         # 加载模型组件（FP32）
-        # Scribble ControlNet 恢复
-        scribble_path = os.path.join(resume_dir, "controlnet_scribble")
-        tile_path = os.path.join(resume_dir, "controlnet_tile")
+        # Canny ControlNet 恢复
+        canny_path = os.path.join(resume_dir, "controlnet_canny")
         
-        print(f"  Scribble 路径: {scribble_path}")
-        print(f"    - 路径存在: {os.path.exists(scribble_path)}")
-        print(f"  Tile 路径: {tile_path}")
-        print(f"    - 路径存在: {os.path.exists(tile_path)}")
+        print(f"  Canny 路径: {canny_path}")
+        print(f"    - 路径存在: {os.path.exists(canny_path)}")
         
-        print(f"\n  正在加载 Scribble ControlNet...")
-        controlnet_scribble = ControlNetModel.from_pretrained(
-            scribble_path, 
+        print(f"\n  正在加载 Canny ControlNet...")
+        controlnet_canny = ControlNetModel.from_pretrained(
+            canny_path, 
             torch_dtype=torch.float32,
             local_files_only=True
         ).to(device)
-        print(f"  ✓ Scribble ControlNet 加载成功")
-        
-        print(f"  正在加载 Tile ControlNet...")
-        controlnet_tile = ControlNetModel.from_pretrained(
-            tile_path, 
-            torch_dtype=torch.float32,
-            local_files_only=True
-        ).to(device)
-        print(f"  ✓ Tile ControlNet 加载成功")
+        print(f"  ✓ Canny ControlNet 加载成功")
         
         vae = AutoencoderKL.from_pretrained(
             base_dir, subfolder="vae", local_files_only=True
@@ -766,16 +748,11 @@ def main():
         print(f"✓ 已加载 Dual ControlNet checkpoint (step {resume_step})")
     else:
         # 从预训练模型开始（FP32）
-        print("正在加载预训练的 Scribble + Tile ControlNet...")
-        controlnet_scribble = ControlNetModel.from_pretrained(
-            ctrl_scribble_dir, local_files_only=True
+        print("正在加载预训练的 Canny ControlNet...")
+        controlnet_canny = ControlNetModel.from_pretrained(
+            ctrl_canny_dir, local_files_only=True
         ).to(device)
-        print(f"✓ Scribble ControlNet 加载完成")
-        
-        controlnet_tile = ControlNetModel.from_pretrained(
-            ctrl_tile_dir, local_files_only=True
-        ).to(device)
-        print(f"✓ Tile ControlNet 加载完成")
+        print(f"✓ Canny ControlNet 加载完成")
         
         vae = AutoencoderKL.from_pretrained(
             base_dir, subfolder="vae", local_files_only=True
@@ -795,18 +772,16 @@ def main():
     unet.requires_grad_(False)
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    controlnet_scribble.requires_grad_(True)
-    controlnet_tile.requires_grad_(True)
+    controlnet_canny.requires_grad_(True)
 
     # 优化器和调度器
     noise_scheduler = DDPMScheduler.from_pretrained(
         base_dir, subfolder="scheduler", local_files_only=True
     )
 
-    # 优化器：同时优化两个ControlNet
-    import itertools
+    # 优化器：仅训练单路 Canny ControlNet
     opt = torch.optim.AdamW(
-        itertools.chain(controlnet_scribble.parameters(), controlnet_tile.parameters()), 
+        controlnet_canny.parameters(),
         lr=5e-5, weight_decay=1e-2
     )
     mse = nn.MSELoss()
@@ -829,8 +804,7 @@ def main():
     unet.eval()
     vae.eval()
     text_encoder.eval()
-    controlnet_scribble.train()
-    controlnet_tile.train()
+    controlnet_canny.train()
 
     # 计时和统计
     if device.type == "cuda":
@@ -873,8 +847,7 @@ def main():
         print(f"正在验证集上评估模型...")
         print(f"{'='*70}")
         
-        controlnet_scribble.eval()
-        controlnet_tile.eval()
+        controlnet_canny.eval()
         
         # 【v10-3 新增】如果是第一次验证，随机选择固定子集
         if val_indices is None:
@@ -894,12 +867,12 @@ def main():
             for idx in val_indices:
                 # 从数据集中直接获取指定索引的样本
                 batch_data = val_dataset[idx]
-                cond_scribble, cond_tile, tgt, cond_path, tgt_path = batch_data
+                _, cond_tile, tgt, cond_path, tgt_path = batch_data
                 
                 # 添加 batch 维度并移到设备
-                cond_scribble = cond_scribble.unsqueeze(0).to(device)
                 cond_tile = cond_tile.unsqueeze(0).to(device)
                 tgt = tgt.unsqueeze(0).to(device)
+                cond_canny = make_canny_batch(cond_tile)
                 b = 1
                 
                 # VAE 编码
@@ -914,31 +887,15 @@ def main():
                 # 文本编码
                 prompt_embeds = get_prompt_embeds(b)
                 
-                # Dual ControlNet 前向传播
-                down_samples_scribble, mid_sample_scribble = controlnet_scribble(
+                # 单路 Canny ControlNet 前向传播
+                down_samples, mid_sample = controlnet_canny(
                     noisy_latents,
                     timesteps,
                     encoder_hidden_states=prompt_embeds,
-                    controlnet_cond=cond_scribble,
-                    conditioning_scale=args.scribble_scale,
+                    controlnet_cond=cond_canny,
+                    conditioning_scale=args.canny_scale,
                     return_dict=False
                 )
-                
-                down_samples_tile, mid_sample_tile = controlnet_tile(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                    controlnet_cond=cond_tile,
-                    conditioning_scale=args.tile_scale,
-                    return_dict=False
-                )
-                
-                # 合并两个ControlNet的输出
-                down_samples = [
-                    d_scribble + d_tile 
-                    for d_scribble, d_tile in zip(down_samples_scribble, down_samples_tile)
-                ]
-                mid_sample = mid_sample_scribble + mid_sample_tile
                 
                 # UNet 预测噪声
                 noise_pred = unet(
@@ -959,8 +916,7 @@ def main():
                 val_losses.append(total_loss.item())
         
         # 恢复训练模式
-        controlnet_scribble.train()
-        controlnet_tile.train()
+        controlnet_canny.train()
         
         avg_total_loss = np.mean(val_losses) if len(val_losses) > 0 else float('inf')
         
@@ -1011,12 +967,11 @@ def main():
                 break
             
             # 数据解包（两个数据加载器返回格式相同）
-            # CF-FA: [vessel, tile, tgt, paths...]
-            # CF-OCTA: [hed, tile, tgt, paths...]
-            cond_scribble, cond_tile, tgt, cond_paths, tgt_paths = batch_data
-            cond_scribble = cond_scribble.to(device)
+            # 使用 cond_tile 生成 Canny 边缘
+            _, cond_tile, tgt, cond_paths, tgt_paths = batch_data
             cond_tile = cond_tile.to(device)
             tgt = tgt.to(device)
+            cond_canny = make_canny_batch(cond_tile)  # [0,1]
             b = tgt.shape[0]
             
             # 第一步保存调试图像（原图、配准图、Tile输入）
@@ -1028,13 +983,9 @@ def main():
                 cond_filename = os.path.splitext(os.path.basename(cond_paths[0]))[0]
                 tgt_filename = os.path.splitext(os.path.basename(tgt_paths[0]))[0]
                 
-                # 1. 保存Scribble条件图（Vessel）
-                cond_scribble_save = (cond_scribble[0].cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
-                Image.fromarray(cond_scribble_save).save(os.path.join(debug_dir, f"{cond_filename}_scribble_input.png"))
-                
-                # 2. 保存Tile条件图（原图）
-                cond_tile_save = (cond_tile[0].cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
-                Image.fromarray(cond_tile_save).save(os.path.join(debug_dir, f"{cond_filename}_tile_input.png"))
+                # 保存 Canny 条件图
+                cond_canny_save = (cond_canny[0].cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
+                Image.fromarray(cond_canny_save).save(os.path.join(debug_dir, f"{cond_filename}_canny_input.png"))
                 
                 # 3. 保存配准后的目标图
                 tgt_save = ((tgt[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
@@ -1056,33 +1007,15 @@ def main():
                 # 文本编码（空 prompt）
                 prompt_embeds = get_prompt_embeds(b)
             
-            # Dual ControlNet 前向传播
-            # 1. Scribble ControlNet (Vessel或HED)
-            down_samples_scribble, mid_sample_scribble = controlnet_scribble(
+            # 单路 Canny ControlNet 前向
+            down_samples, mid_sample = controlnet_canny(
                 noisy_latents,
                 timesteps,
                 encoder_hidden_states=prompt_embeds,
-                controlnet_cond=cond_scribble,  # Scribble 条件：Vessel或HED
-                conditioning_scale=args.scribble_scale,  # Scribble 强度
+                controlnet_cond=cond_canny,
+                conditioning_scale=args.canny_scale,
                 return_dict=False
             )
-            
-            # 2. Tile ControlNet
-            down_samples_tile, mid_sample_tile = controlnet_tile(
-                noisy_latents,
-                timesteps,
-                encoder_hidden_states=prompt_embeds,
-                controlnet_cond=cond_tile,  # Tile 条件：原图
-                conditioning_scale=args.tile_scale,  # Tile 强度
-                return_dict=False
-            )
-            
-            # 3. 合并两个ControlNet的输出
-            down_samples = [
-                d_scribble + d_tile 
-                for d_scribble, d_tile in zip(down_samples_scribble, down_samples_tile)
-            ]
-            mid_sample = mid_sample_scribble + mid_sample_tile
             
             # UNet 预测噪声
             noise_pred = unet(
@@ -1180,8 +1113,7 @@ def main():
 
                 msg_parts.extend([
                     f"t={t_val:3d}",
-                    f"S:{args.scribble_scale}",
-                    f"T:{args.tile_scale}",
+                    f"Canny:{args.canny_scale}",
                     f"{elapsed:.1f}s"
                 ])
                 msg = " | ".join(msg_parts)
@@ -1233,8 +1165,7 @@ def main():
                 # 3. 保存 latest_checkpoint（每次覆盖）
                 os.makedirs(latest_ckpt_dir, exist_ok=True)
                 
-                controlnet_scribble.save_pretrained(os.path.join(latest_ckpt_dir, "controlnet_scribble"))
-                controlnet_tile.save_pretrained(os.path.join(latest_ckpt_dir, "controlnet_tile"))
+                controlnet_canny.save_pretrained(os.path.join(latest_ckpt_dir, "controlnet_canny"))
                 torch.save(opt.state_dict(), os.path.join(latest_ckpt_dir, "optimizer.pt"))
                 
                 # 保存 latest 的元信息（标注当前步数）
@@ -1247,8 +1178,7 @@ def main():
                 print(f"✓ Latest Checkpoint 已保存: {latest_ckpt_dir}")
                 print(f"  - Latest Step: {global_step}")
                 print(f"  - Validation Loss: {val_loss:.6f}")
-                print(f"  - controlnet_scribble/")
-                print(f"  - controlnet_tile/")
+                print(f"  - controlnet_canny/")
                 print(f"  - latest_info.txt")
                 print(f"{'='*70}\n")
                 
@@ -1256,8 +1186,7 @@ def main():
                 if is_best:
                     os.makedirs(best_ckpt_dir, exist_ok=True)
                     
-                    controlnet_scribble.save_pretrained(os.path.join(best_ckpt_dir, "controlnet_scribble"))
-                    controlnet_tile.save_pretrained(os.path.join(best_ckpt_dir, "controlnet_tile"))
+                    controlnet_canny.save_pretrained(os.path.join(best_ckpt_dir, "controlnet_canny"))
                     torch.save(opt.state_dict(), os.path.join(best_ckpt_dir, "optimizer.pt"))
                     
                     # 保存最佳模型的元信息
