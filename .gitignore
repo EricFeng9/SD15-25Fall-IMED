@@ -11,3 +11,6 @@ pred_smoke.png
 
 
 
+
+__pycache__/
+*.pyc

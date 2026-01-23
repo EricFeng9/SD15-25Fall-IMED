@@ -58,7 +58,8 @@ def unified_inference(
     steps=30,
     seed=42,
     device=None,
-    dataset_type='CFOCTA'  # 'CFFA', 'CFOCT', 'CFOCTA'
+    dataset_type='CFOCTA',  # 'CFFA', 'CFOCT', 'CFOCTA'
+    disable_controlnet=False  # True 时完全关闭 ControlNet 前向
 ):
     """
     统一的推理接口 - 处理所有数据集类型的推理逻辑
@@ -162,7 +163,7 @@ def unified_inference(
         tgt_512_pil = tgt_img_registered.resize((SIZE, SIZE), Image.BICUBIC)
     
     # ============ Step 2: 生成 ControlNet 条件图 ============
-    # 使用统一的条件图生成接口
+    # 使用统一的条件图生成接口（即使关闭 ControlNet 也保留，用于可视化和日志）
     cond_scribble_pil, cond_tile_pil = generate_controlnet_inputs(
         cond_512_pil,
         mode=mode,
@@ -173,6 +174,16 @@ def unified_inference(
     generator = torch.Generator(device=device).manual_seed(seed)
     
     with torch.no_grad():
+        if disable_controlnet:
+            # 完全不经过 ControlNet，仅使用基础 UNet 生成
+            output = pipeline(
+                prompt="",
+                negative_prompt=None,
+                num_inference_steps=steps,
+                guidance_scale=cfg,
+                generator=generator
+            )
+        else:
         output = pipeline(
             prompt="",
             negative_prompt=None,

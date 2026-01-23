@@ -812,6 +812,8 @@ def main():
     mse = nn.MSELoss()
     if args.msssim_lambda > 0:
         msssim_loss_fn = MS_SSIM(data_range=1.0, size_average=True, channel=3).to(device)
+    else:
+        msssim_loss_fn = None  # 当 msssim_lambda == 0 时设为 None
     vae_sf = vae.config.scaling_factor
 
     # 恢复 optimizer

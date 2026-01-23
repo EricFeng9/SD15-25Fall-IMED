@@ -31,7 +31,8 @@ import os, csv, torch, argparse
 import numpy as np
 import cv2
 from PIL import Image
-from diffusers import (StableDiffusionControlNetPipeline, ControlNetModel, 
+from diffusers import (StableDiffusionControlNetPipeline, StableDiffusionPipeline,
+                       ControlNetModel, 
                        DDPMScheduler, 
                        AutoencoderKL, UNet2DConditionModel,
                        MultiControlNetModel)
@@ -105,6 +106,8 @@ parser.add_argument("--seed", type=int, default=None,
 # FP16 支持
 parser.add_argument("--use_fp16", action="store_true",
                     help="使用 FP16 推理（降低显存）")
+parser.add_argument("--disable_controlnet", action="store_true",
+                    help="完全关闭 ControlNet（不加载、不前向），用于无 ControlNet 消融")
 
 args = parser.parse_args()
 
@@ -133,6 +136,11 @@ print(f"\n数据集: {dataset_type_name}")
 print(f"测试集CSV: {args.csv}")
 
 # ============ 解析 ControlNet 目录 ============
+if args.disable_controlnet:
+    ctrl_dir = None
+    ctrl_scribble_dir = None
+    ctrl_tile_dir = None
+else:
 if args.ctrl_dir:
     ctrl_dir = args.ctrl_dir
 else:
@@ -201,14 +209,18 @@ with open(log_path, "a") as f:
 
 print("\n正在加载模型...")
 print(f"  数据集: {'CF-FA' if is_cffa else ('CF_OCT' if is_cfoct else 'CF-OCTA')}")
+if not args.disable_controlnet:
 print(f"  ControlNet-Scribble: {ctrl_scribble_dir}")
 print(f"  ControlNet-Tile: {ctrl_tile_dir}")
+else:
+    print("  ControlNet: 已关闭（不加载、不前向）")
 print(f"  精度: {'FP16' if args.use_fp16 else 'FP32'}")
 
 # ============ 加载模型组件（与训练脚本一致）============
 dtype = torch.float16 if args.use_fp16 else torch.float32
 device = torch.device("cuda")
 
+if not args.disable_controlnet:
 # 所有模式都加载双路 ControlNet (Scribble + Tile)
 # 加载 Scribble ControlNet
 controlnet_scribble = ControlNetModel.from_pretrained(
@@ -230,6 +242,10 @@ print("✓ Tile ControlNet 加载完成")
 controlnet_scribble.eval()
 controlnet_tile.eval()
 print("✓ 双路 ControlNet 已设置为 eval 模式")
+else:
+    controlnet_scribble = None
+    controlnet_tile = None
+    print("✓ 跳过 ControlNet 加载")
 
 # 加载其他组件
 vae = AutoencoderKL.from_pretrained(
@@ -257,6 +273,7 @@ noise_scheduler = DDPMScheduler.from_pretrained(
 )
 print("✓ 使用 DDPMScheduler（与训练一致）")
 
+if not args.disable_controlnet:
 # 所有模式都使用 MultiControlNet (Scribble + Tile)
 multi_controlnet = MultiControlNetModel([controlnet_scribble, controlnet_tile])
 print("✓ MultiControlNet 组合完成 (Scribble + Tile)")
@@ -271,6 +288,17 @@ pipe = StableDiffusionControlNetPipeline(
     safety_checker=None,
     feature_extractor=None
 )
+else:
+    # 完全关闭 ControlNet，使用基础 StableDiffusionPipeline
+    pipe = StableDiffusionPipeline(
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        unet=unet,
+        scheduler=noise_scheduler,
+        safety_checker=None,
+        feature_extractor=None
+    )
 
 # 显存优化
 if hasattr(pipe, 'enable_attention_slicing'):
@@ -450,7 +478,8 @@ with open(args.csv) as f:
                 steps=args.steps,
                 seed=used_seed,
                 device=device,
-                dataset_type=dataset_type
+                dataset_type=dataset_type,
+                disable_controlnet=args.disable_controlnet
             )
             
             # 提取结果
