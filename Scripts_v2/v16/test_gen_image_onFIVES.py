@@ -64,7 +64,7 @@ INPUT_IMAGE_DIR = "/data/student/Fengjunming/SDXL_ControlNet/data/FIVES_extract"
 BASE_MODEL_DIR = "/data/student/Fengjunming/SDXL_ControlNet/models/sd15-diffusers"
 
 # 各模态转换模型名称 (对应 results/out_ctrl_sd15_dual/[mode]/[name]/best_checkpoint)
-cf2fa_name = "260115_1"
+cf2fa_name = "260121_2"
 fa2cf_name = "260115_3"
 cf2oct_name = "260116_1"
 oct2cf_name = "260116_1"
