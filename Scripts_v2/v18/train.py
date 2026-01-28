@@ -39,7 +39,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "../../data/operation_pr
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../data/operation_pre_filtered_octfa_augmented"))
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../data/CF_OCTA_v2_repaired"))
 from operation_pre_filtered_cffa_augmented_dataset import CFFADataset as CFFADataset_v2
-from cffa_augmented_dataset import CFFADataset as CFFADataset_v1
 from operation_pre_filtered_cfoct_augmented_dataset import CFOCTDataset
 from operation_pre_filtered_octfa_augmented_dataset import OCTFADataset
 from cf_octa_v2_repaired_dataset import CFOCTADataset
@@ -320,14 +319,9 @@ def main():
         train_ds = CFOCTADataset(split='train', mode=args.mode)
         val_ds = CFOCTADataset(split='test', mode=args.mode)
     elif 'cf' in args.mode and 'fa' in args.mode:
-        train_ds = torch.utils.data.ConcatDataset([
-            CFFADataset_v1(split='train', mode=args.mode),
-            CFFADataset_v2(split='train', mode=args.mode)
-        ])
-        val_ds = torch.utils.data.ConcatDataset([
-            CFFADataset_v1(split='test', mode=args.mode),
-            CFFADataset_v2(split='test', mode=args.mode)
-        ])
+        # 仅使用 operation_pre_filtered_cffa_augmented 版本的数据集
+        train_ds = CFFADataset_v2(split='train', mode=args.mode)
+        val_ds = CFFADataset_v2(split='test', mode=args.mode)
     elif 'cf' in args.mode and 'oct' in args.mode:
         train_ds = CFOCTDataset(split='train', mode=args.mode)
         val_ds = CFOCTDataset(split='test', mode=args.mode)

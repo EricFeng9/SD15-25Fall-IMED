@@ -58,13 +58,13 @@ def generate_controlnet_inputs_v15(img_pil, mode):
 
 # ============ 配置变量（在程序开头指定）============
 # 1. 目标图片路径（待推理的图片目录）
-INPUT_IMAGE_DIR = "/data/student/Fengjunming/SDXL_ControlNet/data/FIVES_extract"
+INPUT_IMAGE_DIR = "/data/student/Fengjunming/SDXL_ControlNet/data/FIVES_extract_v3"
 
 # 2. SD15模型和ControlNet模型路径（多模态）
 BASE_MODEL_DIR = "/data/student/Fengjunming/SDXL_ControlNet/models/sd15-diffusers"
 
 # 各模态转换模型名称 (对应 results/out_ctrl_sd15_dual/[mode]/[name]/best_checkpoint)
-cf2fa_name = "260121_2"
+cf2fa_name = "260128_2" #1.28已修改
 fa2cf_name = "260115_3"
 cf2oct_name = "260116_1"
 oct2cf_name = "260116_1"
