@@ -173,6 +173,18 @@ def main():
     ).to(device)
     pipe.scheduler = DDPMScheduler.from_pretrained(base_model_dir, subfolder="scheduler")
     
+    # 尝试加载 UNet 的 LoRA 权重（如果当前 checkpoint 中存在）
+    lora_dir = os.path.join(ckpt_path, "unet_lora")
+    if os.path.isdir(lora_dir):
+        logger.info(f"检测到 UNet LoRA 权重，正在从 {lora_dir} 加载到 UNet...")
+        try:
+            pipe.unet.load_attn_procs(lora_dir)
+            logger.info("UNet LoRA 加载完成，将在推理中启用域适配。")
+        except Exception as e:
+            logger.warning(f"UNet LoRA 加载失败，回退到原始 UNet。错误: {e}")
+    else:
+        logger.info("未检测到 UNet LoRA 权重，使用原始 UNet 推理。")
+    
     # 2. 加载数据集 (对齐 train.py)
     if 'cf' in args.mode and 'fa' in args.mode:
         # 对齐 train.py: 仅使用 operation_pre_filtered_cffa_augmented 版本
@@ -237,11 +249,11 @@ def main():
         logger.debug(f"[Debug] pred 范围: [{pred_np.min()}, {pred_np.max()}], 均值: {pred_np.mean():.2f}")
         logger.debug(f"[Debug] gt 范围: [{gt_np.min()}, {gt_np.max()}], 均值: {gt_np.mean():.2f}")
         logger.debug(f"[Debug] tile 范围: [{tile_np.min()}, {tile_np.max()}], 均值: {tile_np.mean():.2f}")
-
+        
         # 计算亮度比值
         pred_brightness, gt_brightness, brightness_ratio = calculate_brightness_ratio(pred_np, gt_np)
         logger.info(f"[亮度比值] pred平均亮度: {pred_brightness:.2f}, gt平均亮度: {gt_brightness:.2f}, 比值(pred/gt): {brightness_ratio:.4f}")
-        
+       
         # 应用黑边蒙版（基于 tile 输入）- 仅用于保存可视化图像
         mask = mask_gen(tile_np)
         pred_masked = (pred_np * np.stack([mask]*3, axis=-1)).astype(np.uint8)

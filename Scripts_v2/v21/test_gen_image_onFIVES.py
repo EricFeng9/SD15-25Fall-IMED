@@ -313,10 +313,21 @@ def get_pipeline(mode):
         raise ValueError(f"未定义模式 {mode} 的名称变量 {name_var}")
     
     name = getattr(sys.modules[__name__], name_var)
-    scribble_path = os.path.join(CHECKPOINT_BASE.format(mode=mode, name=name), "controlnet_scribble")
-    tile_path = os.path.join(CHECKPOINT_BASE.format(mode=mode, name=name), "controlnet_tile")
+    ckpt_dir = CHECKPOINT_BASE.format(mode=mode, name=name)
+    scribble_path = os.path.join(ckpt_dir, "controlnet_scribble")
+    tile_path = os.path.join(ckpt_dir, "controlnet_tile")
+    lora_path = os.path.join(ckpt_dir, "unet_lora")
     
     print(f"  正在加载 {mode} 模型 (name: {name})...")
+    
+    # 若存在 UNet LoRA，则优先为当前 mode 加载对应 LoRA（仅影响 UNet 注意力层）
+    if os.path.isdir(lora_path):
+        print(f"  检测到 {mode} 的 UNet LoRA，小权重路径: {lora_path}")
+        try:
+            unet.load_attn_procs(lora_path)
+            print("  UNet LoRA 已加载，将在该模式推理中启用。")
+        except Exception as e:
+            print(f"  [警告] 加载 UNet LoRA 失败，将使用原始 UNet。错误: {e}")
     
     # 加载 ControlNet
     controlnet_scribble = ControlNetModel.from_pretrained(

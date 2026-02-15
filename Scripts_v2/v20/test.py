@@ -96,16 +96,6 @@ def dice_coefficient(pred_mask, gt_mask, eps=1e-6):
     dice = (2.0 * intersection + eps) / (union + eps)
     return dice.item()
 
-def calculate_brightness_ratio(pred, gt):
-    """
-    计算 pred 和 gt 的亮度比值
-    pred, gt: numpy array [H, W, C] 或 [H, W]
-    """
-    pred_brightness = np.mean(pred)
-    gt_brightness = np.mean(gt)
-    ratio = pred_brightness / gt_brightness if gt_brightness > 0 else 0
-    return pred_brightness, gt_brightness, ratio
-
 # ============ 2. 主推理流程 ============
 
 def main():
@@ -130,27 +120,14 @@ def main():
     import logging
     import time
     log_path = os.path.join(exp_dir, f"test_log_{args.step}_{time.strftime('%Y%m%d_%H%M%S')}.txt")
-    
-    # 文件日志：保留 DEBUG 级别（包含所有详细信息）
-    file_handler = logging.FileHandler(log_path)
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    
-    # 控制台日志：只显示 INFO 及以上级别（过滤掉 PNG 处理的 DEBUG 信息）
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    
-    # 配置根 logger
     logging.basicConfig(
-        level=logging.DEBUG,  # 根级别设为 DEBUG，由各个 handler 控制实际输出级别
-        handlers=[file_handler, console_handler]
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_path),
+            logging.StreamHandler(sys.stdout)
+        ]
     )
-    
-    # 禁用第三方库的 DEBUG 日志（如 PIL/Pillow 的 PNG 处理信息）
-    logging.getLogger('PIL').setLevel(logging.WARNING)
-    logging.getLogger('Pillow').setLevel(logging.WARNING)
-    
     logger = logging.getLogger(__name__)
 
     logger.info(f"开始测试实验: {args.name} | 模式: {args.mode} | 权重: {args.step}")
@@ -234,14 +211,10 @@ def main():
         # 【v19修正】cond_tile 现在是 [-1, 1] 范围
         tile_np = ((cond_tile[0].cpu().numpy().transpose(1, 2, 0) + 1) / 2 * 255).astype(np.uint8)
         
-        logger.debug(f"[Debug] pred 范围: [{pred_np.min()}, {pred_np.max()}], 均值: {pred_np.mean():.2f}")
-        logger.debug(f"[Debug] gt 范围: [{gt_np.min()}, {gt_np.max()}], 均值: {gt_np.mean():.2f}")
-        logger.debug(f"[Debug] tile 范围: [{tile_np.min()}, {tile_np.max()}], 均值: {tile_np.mean():.2f}")
-
-        # 计算亮度比值
-        pred_brightness, gt_brightness, brightness_ratio = calculate_brightness_ratio(pred_np, gt_np)
-        logger.info(f"[亮度比值] pred平均亮度: {pred_brightness:.2f}, gt平均亮度: {gt_brightness:.2f}, 比值(pred/gt): {brightness_ratio:.4f}")
-        
+        print(f"[Debug] pred 范围: [{pred_np.min()}, {pred_np.max()}], 均值: {pred_np.mean():.2f}")
+        print(f"[Debug] gt 范围: [{gt_np.min()}, {gt_np.max()}], 均值: {gt_np.mean():.2f}")
+        print(f"[Debug] tile 范围: [{tile_np.min()}, {tile_np.max()}], 均值: {tile_np.mean():.2f}")
+       
         # 应用黑边蒙版（基于 tile 输入）- 仅用于保存可视化图像
         mask = mask_gen(tile_np)
         pred_masked = (pred_np * np.stack([mask]*3, axis=-1)).astype(np.uint8)
@@ -275,8 +248,7 @@ def main():
                     pred_vessel = extract_vessel_map(pred_tensor_01, 'fa', args.mode)
                     gt_vessel = extract_vessel_map(gt_tensor_01, 'fa', args.mode)
 
-                    # 【评估阶段】使用 Otsu 自适应阈值做二值化，计算二值化的 Dice 指标
-                    # 注意：训练时使用连续响应图（见 train.py），评估时使用二值化以获得更直观的指标
+                    # 在 Frangi 输出上分别使用 Otsu 自适应阈值做二值化
                     pred_bin = binarize_vessel_map_otsu(pred_vessel)
                     gt_bin = binarize_vessel_map_otsu(gt_vessel)
 

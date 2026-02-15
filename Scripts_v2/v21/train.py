@@ -18,6 +18,7 @@ import time
 import random
 import argparse
 import gc
+import inspect
 import numpy as np
 import torch
 import torch.nn as nn
@@ -25,11 +26,101 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from PIL import Image
 from torchvision import transforms
-from diffusers import (DDPMScheduler, ControlNetModel, AutoencoderKL, UNet2DConditionModel, 
-                       StableDiffusionControlNetPipeline, MultiControlNetModel)
+from diffusers import (
+    DDPMScheduler,
+    ControlNetModel,
+    AutoencoderKL,
+    UNet2DConditionModel,
+    StableDiffusionControlNetPipeline,
+    MultiControlNetModel,
+)
 from transformers import CLIPTextModel, CLIPTokenizer
 from pytorch_msssim import MS_SSIM
+from diffusers.models.attention_processor import LoRAAttnProcessor, LoRAAttnProcessor2_0, AttnProcessor
+from peft import LoraConfig, get_peft_model, TaskType
 #import bitsandbytes as bnb
+
+def verify_and_fix_lora_application(unet, target_modules):
+    """
+    验证并修复 LoRA 应用：确保目标模块被正确替换为 LoRA 版本。
+    
+    这个函数用于检查 PEFT 库是否正确地将 target_modules 中的 Linear 层
+    替换为 LoraLinear 层。如果发现某些模块仍然是 Linear 而不是 LoraLinear，
+    会打印警告信息并提供解决建议。
+    
+    参数:
+        unet: 应用了 LoRA 的 UNet 模型
+        target_modules: 目标模块名称列表，例如 ["to_k", "to_q", "to_v", "to_out.0"]
+    
+    返回:
+        tuple: (replaced_count, not_replaced_count) - 已替换和未替换的模块数量
+    
+    注意:
+        如果发现模块未被替换，可能的原因包括：
+        1. PEFT 库版本问题 - 尝试升级 peft: pip install --upgrade peft
+        2. 模块名称不完全匹配 - 检查 target_modules 是否正确
+        3. 模块结构特殊 - 某些 diffusers 版本可能需要不同的配置
+        
+        如果问题持续，可以考虑使用 diffusers 内置的 LoRA 支持：
+        from diffusers.models.attention_processor import LoRAAttnProcessor
+        unet.set_attn_processor(LoRAAttnProcessor(...))
+    """
+    import torch.nn as nn
+    
+    replaced_count = 0
+    not_replaced_count = 0
+    not_replaced_modules = []
+    
+    # 尝试导入 LoraLinear（不同版本的 peft 可能路径不同）
+    try:
+        from peft.tuners.lora import Linear as LoraLinear
+    except ImportError:
+        try:
+            from peft.tuners.lora.layer import Linear as LoraLinear
+        except ImportError:
+            # 如果无法导入，使用类型名称字符串检查
+            LoraLinear = None
+    
+    # 遍历所有模块，查找目标模块
+    for name, module in unet.named_modules():
+        module_name = name.split('.')[-1]  # 获取模块的最后一部分名称
+        
+        # 检查是否是目标模块
+        if module_name in target_modules:
+            # 检查模块类型
+            if LoraLinear is not None:
+                if isinstance(module, LoraLinear):
+                    replaced_count += 1
+                elif isinstance(module, nn.Linear):
+                    not_replaced_count += 1
+                    not_replaced_modules.append(name)
+            else:
+                # 使用类型名称字符串检查
+                module_type_name = type(module).__name__
+                if 'Lora' in module_type_name or 'lora' in module_type_name.lower():
+                    replaced_count += 1
+                elif isinstance(module, nn.Linear):
+                    not_replaced_count += 1
+                    not_replaced_modules.append(name)
+    
+    print(f"\n【LoRA 应用验证】")
+    print(f"  - 已替换为 LoRA 的模块数: {replaced_count}")
+    print(f"  - 仍为 Linear 的模块数: {not_replaced_count}")
+    
+    if not_replaced_count > 0:
+        print(f"  ⚠️  警告：以下模块未被替换为 LoRA:")
+        for mod_name in not_replaced_modules[:10]:  # 只显示前10个
+            print(f"    - {mod_name}")
+        if len(not_replaced_modules) > 10:
+            print(f"    ... 还有 {len(not_replaced_modules) - 10} 个模块")
+        
+        print(f"\n  提示：如果模块未被替换，可能是因为:")
+        print(f"    1. 模块名称不完全匹配 target_modules")
+        print(f"    2. PEFT 库版本问题")
+        print(f"    3. 模块结构特殊，需要手动处理")
+    
+    return replaced_count, not_replaced_count
+
 # 导入自定义模块
 import sys
 # 将数据目录加入路径以便导入 dataset
@@ -204,9 +295,17 @@ def evaluate(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, msssim_fn, toke
             down_s, mid_s = cn_s(noisy_latents, timesteps, prompt_embeds, cond_scribble, args.scribble_scale, return_dict=False)
             down_t, mid_t = cn_t(noisy_latents, timesteps, prompt_embeds, cond_tile, args.tile_scale, return_dict=False)
             
-            noise_pred = unet(noisy_latents, timesteps, prompt_embeds, 
+            # UNet 预测
+            # 【PEFT 修复】使用 base_model 访问包含 LoRA 层的模型，绕过 PEFT 包装器的 forward 方法
+            # base_model 仍然包含 LoRA 层，但不会自动添加不兼容的参数（如 input_ids）
+            noise_pred = unet.base_model(
+                sample=noisy_latents,
+                timestep=timesteps,
+                encoder_hidden_states=prompt_embeds,
                               down_block_additional_residuals=[s+t for s,t in zip(down_s, down_t)],
-                              mid_block_additional_residual=mid_s+mid_t).sample
+                mid_block_additional_residual=mid_s+mid_t,
+                return_dict=False
+            )[0]
             
             # 使用与训练一致的综合损失作为验证指标（包含纹理/血管/梯度等）
             total_loss, _, _, _, _, _ = compute_total_loss(
@@ -231,12 +330,14 @@ def visualize_inference(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, toke
     cn_s.eval(); cn_t.eval()
     
     # 构建 pipeline
+    # 【PEFT 修复】使用 unet.base_model 而不是 unet，避免 PEFT 包装器自动添加不兼容的参数（如 input_ids）
+    # base_model 仍然包含 LoRA 层，但不会经过 PEFT 包装器的 forward 方法
     multi_controlnet = MultiControlNetModel([cn_s, cn_t])
     pipe = StableDiffusionControlNetPipeline(
         vae=vae,
         text_encoder=text_encoder,
         tokenizer=tokenizer,
-        unet=unet,
+        unet=unet.base_model,
         controlnet=multi_controlnet,
         scheduler=noise_scheduler,
         safety_checker=None,
@@ -355,10 +456,80 @@ def main():
     cn_s = ControlNetModel.from_pretrained(SCRIBBLE_CN_DIR).to(DEVICE)
     cn_t = ControlNetModel.from_pretrained(TILE_CN_DIR).to(DEVICE)
     
-    unet.requires_grad_(False); vae.requires_grad_(False); text_encoder.requires_grad_(False)
+    # 冻结 VAE / 文本编码器，同时训练 ControlNet 和 UNet LoRA
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    # ControlNet 保持可训练状态（不冻结）
+    # cn_s 和 cn_t 的 requires_grad 默认为 True，不需要显式设置
+    
+    # ============ UNet LoRA 配置 ============
+    unet_lora_rank = 16
+    unet_lora_alpha = 16
+    
+    # 冻结 UNet 原始权重
+    unet.requires_grad_(False)
+    
+    # 使用 peft 库创建 LoRA 适配器
+    # 目标模块：注意力层的关键组件
+    target_modules = ["to_k", "to_q", "to_v", "to_out.0"]
+    
+    lora_config = LoraConfig(
+        r=unet_lora_rank,
+        lora_alpha=unet_lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=0.0,
+        bias="none",
+        task_type=TaskType.FEATURE_EXTRACTION,
+    )
+    
+    # 将 LoRA 应用到 UNet
+    unet = get_peft_model(unet, lora_config)
+    
+    # 验证 LoRA 是否正确应用
+    verify_and_fix_lora_application(unet, target_modules)
+    
+    # 收集可训练的 LoRA 参数
+    trainable_params = [p for p in unet.parameters() if p.requires_grad]
+    num_trainable_params = sum(p.numel() for p in trainable_params)
+    num_total_params = sum(p.numel() for p in unet.parameters())
+    
+    # 打印 LoRA 参数信息
+    print(f"✓ 使用 UNet LoRA 训练")
+    print(f"  - LoRA rank: {unet_lora_rank}, alpha: {unet_lora_alpha}")
+    print(f"  - LoRA 可训练参数量: {num_trainable_params:,} ({num_trainable_params/1e6:.2f}M)")
+    print(f"  - UNet 总参数量: {num_total_params:,} ({num_total_params/1e6:.2f}M)")
+    print(f"  - LoRA 参数占比: {num_trainable_params/num_total_params*100:.2f}%")
+    
+    # 调试：打印一些 LoRA 参数名称示例
+    lora_param_names = [name for name, param in unet.named_parameters() if param.requires_grad]
+    if lora_param_names:
+        print(f"  - LoRA 参数示例 (前5个): {lora_param_names[:5]}")
+    else:
+        print(f"  ⚠️  警告：未找到任何可训练的 LoRA 参数！")
+    
+    # 收集 ControlNet 可训练参数
+    cn_s_trainable = [p for p in cn_s.parameters() if p.requires_grad]
+    cn_t_trainable = [p for p in cn_t.parameters() if p.requires_grad]
+    cn_s_num = sum(p.numel() for p in cn_s_trainable)
+    cn_t_num = sum(p.numel() for p in cn_t_trainable)
+    
+    print(f"\n✓ 同时训练 ControlNet")
+    print(f"  - ControlNet Scribble 可训练参数量: {cn_s_num:,} ({cn_s_num/1e6:.2f}M)")
+    print(f"  - ControlNet Tile 可训练参数量: {cn_t_num:,} ({cn_t_num/1e6:.2f}M)")
+    print(f"  - ControlNet 总可训练参数量: {cn_s_num + cn_t_num:,} ({(cn_s_num + cn_t_num)/1e6:.2f}M)")
     
     noise_scheduler = DDPMScheduler.from_pretrained(BASE_MODEL_DIR, subfolder="scheduler")
-    optimizer = torch.optim.AdamW(list(cn_s.parameters()) + list(cn_t.parameters()), lr=5e-5, weight_decay=1e-2)
+    # 优化器：同时训练 ControlNet 和 UNet LoRA 参数
+    # 使用相同的学习率，也可以考虑为 ControlNet 和 LoRA 设置不同的学习率
+    all_trainable_params = list(cn_s.parameters()) + list(cn_t.parameters()) + trainable_params
+    optimizer = torch.optim.AdamW(
+        all_trainable_params,
+        lr=5e-5,
+        weight_decay=1e-2
+    )
+    print(f"\n✓ 优化器配置：同时训练 ControlNet + UNet LoRA")
+    print(f"  - 总可训练参数量: {cn_s_num + cn_t_num + num_trainable_params:,} ({(cn_s_num + cn_t_num + num_trainable_params)/1e6:.2f}M)")
+    print(f"  - 学习率: 5e-5 (统一学习率)")
     # optimizer = bnb.optim.AdamW8bit(list(cn_s.parameters()) + list(cn_t.parameters()), lr=5e-5)
     msssim_fn = MS_SSIM(data_range=1.0, size_average=True, channel=3).to(DEVICE)
 
@@ -427,13 +598,21 @@ def main():
             
             # 双路 ControlNet 前向
             # 【v19修正】cond_tile 现在是 [-1, 1] 范围，符合 ControlNet 预训练假设
+            # 【混合训练版本】ControlNet 需要计算梯度，不使用 no_grad
             down_s, mid_s = cn_s(noisy_latents, timesteps, prompt_embeds, cond_scribble, args.scribble_scale, return_dict=False)
             down_t, mid_t = cn_t(noisy_latents, timesteps, prompt_embeds, cond_tile, args.tile_scale, return_dict=False)
             
             # UNet 预测
-            noise_pred = unet(noisy_latents, timesteps, prompt_embeds, 
+            # 【PEFT 修复】使用 base_model 访问包含 LoRA 层的模型，绕过 PEFT 包装器的 forward 方法
+            # base_model 仍然包含 LoRA 层，但不会自动添加不兼容的参数（如 input_ids）
+            noise_pred = unet.base_model(
+                sample=noisy_latents,
+                timestep=timesteps,
+                encoder_hidden_states=prompt_embeds,
                               down_block_additional_residuals=[s+t for s,t in zip(down_s, down_t)],
-                              mid_block_additional_residual=mid_s+mid_t).sample
+                mid_block_additional_residual=mid_s+mid_t,
+                return_dict=False
+            )[0]
             
             # 计算 Loss
             loss, l_mse, l_ssim, l_vessel, l_grad, l_tex = compute_total_loss(
@@ -482,7 +661,7 @@ def main():
                 t_val = timesteps[0].item()
                 
                 msg_parts = [
-                    f"[SD15-v15] step {global_step:5d}/{args.max_steps}",
+                    f"[SD15-v21混合] step {global_step:5d}/{args.max_steps}",
                     f"lr:{current_lr:.2e}",
                     f"total:{w_total:.4f}",
                     f"mse:{avg_mse:.4f}",
@@ -529,6 +708,10 @@ def main():
                 os.makedirs(latest_dir, exist_ok=True)
                 cn_s.save_pretrained(os.path.join(latest_dir, "controlnet_scribble"))
                 cn_t.save_pretrained(os.path.join(latest_dir, "controlnet_tile"))
+                # 保存 UNet 的 LoRA 权重（使用 peft 的 save_pretrained）
+                unet_lora_dir = os.path.join(latest_dir, "unet_lora")
+                os.makedirs(unet_lora_dir, exist_ok=True)
+                unet.save_pretrained(unet_lora_dir)
                 
                 # 保存最新元信息 (对齐 v14)
                 with open(os.path.join(latest_dir, "latest_info.txt"), "w", encoding="utf-8") as f:
@@ -543,6 +726,10 @@ def main():
                     os.makedirs(best_dir, exist_ok=True)
                     cn_s.save_pretrained(os.path.join(best_dir, "controlnet_scribble"))
                     cn_t.save_pretrained(os.path.join(best_dir, "controlnet_tile"))
+                    # 保存最佳模型对应的 UNet LoRA 权重（使用 peft 的 save_pretrained）
+                    unet_lora_dir = os.path.join(best_dir, "unet_lora")
+                    os.makedirs(unet_lora_dir, exist_ok=True)
+                    unet.save_pretrained(unet_lora_dir)
                     
                     # 保存最佳元信息 (对齐 v14)
                     with open(os.path.join(best_dir, "best_info.txt"), "w", encoding="utf-8") as f:

@@ -170,7 +170,7 @@ def binarize_vessel_map_otsu(vessel_map: torch.Tensor) -> torch.Tensor:
     说明:
         - 对每个 batch 样本分别在 CPU 上计算 Otsu 阈值；
         - 对于近乎常数的响应图，会退化为全 0（或阈值 0.5），这样 Dice 会自然很低，
-          能如实反映"几乎没有血管响应"的情况。
+          能如实反映“几乎没有血管响应”的情况。
     """
     if vessel_map.dim() != 4:
         raise ValueError(f"Expected vessel_map to be 4D (B,C,H,W), got shape {vessel_map.shape}")

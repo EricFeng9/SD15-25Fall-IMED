@@ -113,6 +113,23 @@ def compute_texture_loss(pred_01, gt_01):
     gt_hf   = gt_01   - gt_blur
     return F.l1_loss(pred_hf, gt_hf)
 
+def compute_intensity_loss(pred_01, gt_01):
+    """
+    轻量级强度统计损失：
+    在整体范围上对齐预测图与 GT 的亮度均值和对比度（标准差），
+    避免模型整体偏灰 / 偏淡。
+    这里使用绿色通道的均值与方差。
+    """
+    pred_gray = pred_01[:, 1:2, :, :]
+    gt_gray   = gt_01[:, 1:2, :, :]
+    
+    pred_mean = pred_gray.mean()
+    gt_mean   = gt_gray.mean()
+    pred_std  = pred_gray.std(unbiased=False)
+    gt_std    = gt_gray.std(unbiased=False)
+    
+    return torch.abs(pred_mean - gt_mean) + torch.abs(pred_std - gt_std)
+
 def get_dynamic_lr(step, max_steps, base_lr=5e-5, min_lr=1e-5):
     """余弦退火学习率衰减"""
     if step < 4000: return base_lr
@@ -122,7 +139,7 @@ def get_dynamic_lr(step, max_steps, base_lr=5e-5, min_lr=1e-5):
 # ============ 2. 核心损失计算 ============
 
 def compute_total_loss(noise_pred, noise, noisy_latents, latents, timesteps, vae, noise_scheduler, msssim_fn, args):
-    """计算综合损失：MSE + MS-SSIM + Vessel Dice + Gradient + Texture"""
+    """计算综合损失：MSE + MS-SSIM + Vessel Dice + Gradient + Texture + Intensity"""
     # 1. 噪声空间 MSE 损失
     loss_mse = F.mse_loss(noise_pred, noise)
     
@@ -147,12 +164,8 @@ def compute_total_loss(noise_pred, noise, noisy_latents, latents, timesteps, vae
     pred_vessel = extract_vessel_map(pred_01, target_type, args.mode)
     with torch.no_grad():
         gt_vessel = extract_vessel_map(gt_01, target_type, args.mode)
-        # 【重要】训练时使用连续血管响应图，不使用 Otsu 二值化
-        # Otsu 二值化会导致训练不稳定（每个样本阈值不同，损失尺度不一致）
-        # Otsu 仅在推理/评估时使用，用于计算二值化的 Dice 指标
     
     smooth = 1e-5
-    # 使用连续响应图计算 Dice，保持梯度平滑和训练稳定
     intersection = (pred_vessel * gt_vessel).sum()
     dice_coeff = (2.0 * intersection + smooth) / (pred_vessel.sum() + gt_vessel.sum() + smooth)
     loss_vessel = 1.0 - dice_coeff
@@ -162,6 +175,9 @@ def compute_total_loss(noise_pred, noise, noisy_latents, latents, timesteps, vae
 
     # 5. 高频纹理损失
     loss_tex = compute_texture_loss(pred_01, gt_01) if args.texture_lambda > 0 else torch.tensor(0.0).to(DEVICE)
+
+    # 6. 强度统计损失（亮度/对比度）
+    loss_int = compute_intensity_loss(pred_01, gt_01) if args.intensity_lambda > 0 else torch.tensor(0.0).to(DEVICE)
     
     # 组合总损失
     total_loss = (
@@ -170,8 +186,9 @@ def compute_total_loss(noise_pred, noise, noisy_latents, latents, timesteps, vae
         + args.vessel_lambda * loss_vessel
         + args.grad_lambda * loss_grad
         + args.texture_lambda * loss_tex
+        + args.intensity_lambda * loss_int
     )
-    return total_loss, loss_mse, loss_msssim, loss_vessel, loss_grad, loss_tex
+    return total_loss, loss_mse, loss_msssim, loss_vessel, loss_grad, loss_tex, loss_int
 
 # ============ 3. 验证与早停逻辑 ============
 
@@ -186,10 +203,8 @@ def evaluate(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, msssim_fn, toke
             b = tgt.shape[0]
             
             # 实时提取血管图作为 Scribble 输入
-            # 【v19修正】cond_tile 现在是 [-1, 1] 范围
             source_type, _ = args.mode.split('2')
-            cond_tile_01 = (cond_tile + 1) / 2  # [-1, 1] → [0, 1]
-            vessel_map = extract_vessel_map(cond_tile_01, source_type, args.mode)
+            vessel_map = extract_vessel_map(cond_tile, source_type, args.mode)
             cond_scribble = vessel_map.repeat(1, 3, 1, 1)
             
             # VAE 编码
@@ -200,16 +215,15 @@ def evaluate(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, msssim_fn, toke
             prompt_embeds = get_prompt_embeds(b, tokenizer, text_encoder)
             
             # ControlNet 推理
-            # 【v19修正】cond_tile 现在是 [-1, 1] 范围，符合 ControlNet 预训练假设
             down_s, mid_s = cn_s(noisy_latents, timesteps, prompt_embeds, cond_scribble, args.scribble_scale, return_dict=False)
             down_t, mid_t = cn_t(noisy_latents, timesteps, prompt_embeds, cond_tile, args.tile_scale, return_dict=False)
             
             noise_pred = unet(noisy_latents, timesteps, prompt_embeds, 
                               down_block_additional_residuals=[s+t for s,t in zip(down_s, down_t)],
                               mid_block_additional_residual=mid_s+mid_t).sample
-            
-            # 使用与训练一致的综合损失作为验证指标（包含纹理/血管/梯度等）
-            total_loss, _, _, _, _, _ = compute_total_loss(
+
+            # 使用与训练一致的综合损失作为验证指标（包含纹理/血管/梯度/强度等）
+            total_loss, _, _, _, _, _, _ = compute_total_loss(
                 noise_pred, noise, noisy_latents, latents, timesteps,
                 vae, noise_scheduler, msssim_fn, args
             )
@@ -253,10 +267,8 @@ def visualize_inference(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, toke
             cond_tile, tgt = cond_tile.to(DEVICE), tgt.to(DEVICE)
             
             # 实时提取血管图作为 Scribble 输入
-            # 【v19修正】cond_tile 现在是 [-1, 1] 范围
             source_type, _ = args.mode.split('2')
-            cond_tile_01 = (cond_tile + 1) / 2  # [-1, 1] → [0, 1]
-            vessel_map = extract_vessel_map(cond_tile_01, source_type, args.mode)
+            vessel_map = extract_vessel_map(cond_tile, source_type, args.mode)
             cond_scribble = vessel_map.repeat(1, 3, 1, 1)
             
             # 推理
@@ -281,9 +293,9 @@ def visualize_inference(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, toke
                 name = f"sample_{i}"
                 
             # 保存输入和目标
-            # 【v19修正】cond_tile 现在是 [-1, 1]，cond_scribble 是 [0, 1]
+            # cond_scribble/tile are [0, 1]
             cond_scribble_save = (cond_scribble[0].cpu().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
-            cond_tile_save = ((cond_tile[0].cpu().permute(1, 2, 0).numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
+            cond_tile_save = (cond_tile[0].cpu().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
             # tgt is [-1, 1]
             tgt_save = ((tgt[0].cpu().permute(1, 2, 0).numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
             
@@ -317,6 +329,8 @@ def main():
     parser.add_argument("--grad_lambda", type=float, default=0.05)
     # 新增：高频纹理损失权重
     parser.add_argument("--texture_lambda", type=float, default=0.2)
+    # 新增：轻量强度统计损失权重
+    parser.add_argument("--intensity_lambda", type=float, default=0.05)
     parser.add_argument("--patience", type=int, default=8)
     args = parser.parse_args()
 
@@ -374,6 +388,7 @@ def main():
     vessel_loss_accumulator = []
     grad_loss_accumulator = []
     texture_loss_accumulator = []
+    intensity_loss_accumulator = []
 
     print(f"\n开始训练 [{args.mode}] - 样本数: {len(train_ds)}")
     
@@ -386,11 +401,9 @@ def main():
             b = tgt.shape[0]
             
             # 【核心逻辑】实时生成血管图作为条件输入
-            # 【v19修正】cond_tile 现在是 [-1, 1] 范围，需要转为 [0, 1] 再提取血管
             source_type, _ = args.mode.split('2')
             with torch.no_grad():
-                cond_tile_01 = (cond_tile + 1) / 2  # [-1, 1] → [0, 1]
-                vessel_map = extract_vessel_map(cond_tile_01, source_type, args.mode)
+                vessel_map = extract_vessel_map(cond_tile, source_type, args.mode)
                 cond_scribble = vessel_map.repeat(1, 3, 1, 1)
 
             # Debug: Step 0 图像保存 (对齐 v14)
@@ -408,11 +421,11 @@ def main():
                 cond_scribble_save = (cond_scribble[0].cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
                 Image.fromarray(cond_scribble_save).save(os.path.join(debug_dir, f"{name}_scribble_input.png"))
                 
-                # 2. 保存Tile条件图 (原图) 【v19修正：现在是 [-1, 1] 范围】
-                cond_tile_save = ((cond_tile[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
+                # 2. 保存Tile条件图 (原图) [Assume [0, 1]]
+                cond_tile_save = (cond_tile[0].cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
                 Image.fromarray(cond_tile_save).save(os.path.join(debug_dir, f"{name}_tile_input.png"))
                 
-                # 3. 保存目标图 (GT) [-1, 1]
+                # 3. 保存目标图 (GT) [Assume [-1, 1]]
                 tgt_save = ((tgt[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
                 Image.fromarray(tgt_save).save(os.path.join(debug_dir, f"{name}_target.png"))
                 
@@ -426,7 +439,6 @@ def main():
             prompt_embeds = get_prompt_embeds(b, tokenizer, text_encoder)
             
             # 双路 ControlNet 前向
-            # 【v19修正】cond_tile 现在是 [-1, 1] 范围，符合 ControlNet 预训练假设
             down_s, mid_s = cn_s(noisy_latents, timesteps, prompt_embeds, cond_scribble, args.scribble_scale, return_dict=False)
             down_t, mid_t = cn_t(noisy_latents, timesteps, prompt_embeds, cond_tile, args.tile_scale, return_dict=False)
             
@@ -435,9 +447,10 @@ def main():
                               down_block_additional_residuals=[s+t for s,t in zip(down_s, down_t)],
                               mid_block_additional_residual=mid_s+mid_t).sample
             
-            # 计算 Loss
-            loss, l_mse, l_ssim, l_vessel, l_grad, l_tex = compute_total_loss(
-                noise_pred, noise, noisy_latents, latents, timesteps, vae, noise_scheduler, msssim_fn, args
+            # 计算 Loss（包含 MSE / 结构 / 血管 / 梯度 / 纹理 / 强度 6 个子项）
+            loss, l_mse, l_ssim, l_vessel, l_grad, l_tex, l_int = compute_total_loss(
+                noise_pred, noise, noisy_latents, latents, timesteps,
+                vae, noise_scheduler, msssim_fn, args
             )
             
             # 反向传播
@@ -455,6 +468,7 @@ def main():
             vessel_loss_accumulator.append(l_vessel.item())
             grad_loss_accumulator.append(l_grad.item())
             texture_loss_accumulator.append(l_tex.item())
+            intensity_loss_accumulator.append(l_int.item())
             
             # 日志打印 (对齐 v14)
             if global_step % 100 == 0:
@@ -465,19 +479,22 @@ def main():
                 avg_vessel = np.mean(vessel_loss_accumulator)
                 avg_grad = np.mean(grad_loss_accumulator)
                 avg_tex = np.mean(texture_loss_accumulator)
+                avg_int = np.mean(intensity_loss_accumulator)
                 
                 # 计算加权后的值用于打印
                 w_ssim = avg_ssim * args.msssim_lambda
                 w_vessel = avg_vessel * args.vessel_lambda
                 w_grad = avg_grad * args.grad_lambda
                 w_tex = avg_tex * args.texture_lambda
-                w_total = avg_mse + w_ssim + w_vessel + w_grad + w_tex
+                w_int = avg_int * args.intensity_lambda
+                w_total = avg_mse + w_ssim + w_vessel + w_grad + w_tex + w_int
                 
                 loss_accumulator = []
                 msssim_loss_accumulator = []
                 vessel_loss_accumulator = []
                 grad_loss_accumulator = []
                 texture_loss_accumulator = []
+                intensity_loss_accumulator = []
                 
                 t_val = timesteps[0].item()
                 
@@ -495,6 +512,8 @@ def main():
                     msg_parts.append(f"grad:{w_grad:.4f}(λ={args.grad_lambda})")
                 if args.texture_lambda > 0:
                     msg_parts.append(f"tex:{w_tex:.4f}(λ={args.texture_lambda})")
+                if args.intensity_lambda > 0:
+                    msg_parts.append(f"int:{w_int:.4f}(λ={args.intensity_lambda})")
                 
                 msg_parts.extend([
                     f"t={t_val:3d}",

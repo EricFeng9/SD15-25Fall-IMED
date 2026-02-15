@@ -42,7 +42,7 @@ from operation_pre_filtered_cffa_augmented_dataset import CFFADataset as CFFADat
 from operation_pre_filtered_cfoct_augmented_dataset import CFOCTDataset
 from operation_pre_filtered_octfa_augmented_dataset import OCTFADataset
 from cf_octa_v2_repaired_dataset import CFOCTADataset
-from vessle_detector import extract_vessel_map
+from vessle_detector import extract_vessel_map, binarize_vessel_map_otsu
 
 # ============ 全局配置 ============
 SIZE = 512
@@ -147,7 +147,7 @@ def compute_total_loss(noise_pred, noise, noisy_latents, latents, timesteps, vae
     pred_vessel = extract_vessel_map(pred_01, target_type, args.mode)
     with torch.no_grad():
         gt_vessel = extract_vessel_map(gt_01, target_type, args.mode)
-        # 【重要】训练时使用连续血管响应图，不使用 Otsu 二值化
+        # 【修复】训练时使用连续血管响应图，不使用 Otsu 二值化
         # Otsu 二值化会导致训练不稳定（每个样本阈值不同，损失尺度不一致）
         # Otsu 仅在推理/评估时使用，用于计算二值化的 Dice 指标
     
