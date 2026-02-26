@@ -11,7 +11,6 @@ import numpy as np
 import cv2
 import sys
 import random
-import re
 from PIL import Image
 from diffusers import (StableDiffusionControlNetPipeline, ControlNetModel, 
                        DDPMScheduler, 
@@ -58,14 +57,13 @@ def generate_controlnet_inputs_v15(img_pil, mode):
 
 # ============ 配置变量（在程序开头指定）============
 # 1. 目标图片路径（待推理的图片目录）
-INPUT_IMAGE_DIR = "/data/student/Fengjunming/SDXL_ControlNet/data/FIVES_extract_v5"
+INPUT_IMAGE_DIR = "/data/student/Fengjunming/SDXL_ControlNet/data/CF_260116"
 
 # 2. SD15模型和ControlNet模型路径（多模态）
 BASE_MODEL_DIR = "/data/student/Fengjunming/SDXL_ControlNet/models/sd15-diffusers"
 
 # 各模态转换模型名称 (对应 results/out_ctrl_sd15_dual/[mode]/[name]/best_checkpoint)
-#cf2fa_name = "260128_2" #1.28已修改
-cf2fa_name = "260213_1"
+cf2fa_name = "260115_1"
 fa2cf_name = "260115_3"
 cf2oct_name = "260116_1"
 oct2cf_name = "260116_1"
@@ -160,8 +158,7 @@ def get_max_inscribed_square(img_np_512):
         img_np_512: 已经resize到512x512的numpy数组图像
     
     返回:
-        square_img: 裁剪后的正方形区域numpy数组
-        coords: (row_min, row_max, col_min, col_max) 裁剪坐标
+        裁剪后的正方形区域numpy数组
     """
     # 获取FOV掩码（已改进，只取最大轮廓）
     fov_mask = get_fov_mask(img_np_512)
@@ -169,7 +166,7 @@ def get_max_inscribed_square(img_np_512):
     
     h, w = valid_mask.shape
     if h == 0 or w == 0:
-        return img_np_512, (0, h, 0, w)
+        return img_np_512
     
     # 使用动态规划找最大全1正方形
     # dp[i][j] 表示以 (i,j) 为右下角的最大正方形边长
@@ -196,7 +193,7 @@ def get_max_inscribed_square(img_np_512):
     if max_side == 0:
         # 没有找到有效正方形，返回原图
         print("警告: 未找到有效的内接正方形，返回原图")
-        return img_np_512, (0, h, 0, w)
+        return img_np_512
     
     # 计算正方形的左上角和右下角坐标
     square_row_min = max_i - max_side + 1
@@ -207,7 +204,7 @@ def get_max_inscribed_square(img_np_512):
     # 裁剪正方形区域
     square_img = img_np_512[square_row_min:square_row_max, square_col_min:square_col_max].copy()
       
-    return square_img, (square_row_min, square_row_max, square_col_min, square_col_max)
+    return square_img
 
 # ============ 黑边蒙版参数配置 ============
 # 注：这些参数用于最终输出时的黑边蒙版（保留原图黑边区域）
@@ -218,8 +215,6 @@ MASK_KERNEL_SIZE = 5     # 平滑核大小
 
 # ============ 参数解析 ============
 parser = argparse.ArgumentParser(description="模型测试脚本 v15 - 批量推理与多模态对齐")
-parser.add_argument("--mode", type=str, default="all", choices=["all", "cf2fa", "cf2oct", "cf2octa"],
-                    help="指定推理模式: all(全部), cf2fa(生成FA), cf2oct(生成OCT), cf2octa(裁剪生成OCTA)")
 parser.add_argument("--prompt", default="",
                     help="文本提示词（正向）")
 parser.add_argument("--negative_prompt", default="",
@@ -244,12 +239,7 @@ if not os.path.isdir(INPUT_IMAGE_DIR):
     raise FileNotFoundError(f"输入图片目录不存在: {INPUT_IMAGE_DIR}")
 
 # 获取所有子文件夹
-def natural_sort_key(s):
-    return [int(text) if text.isdigit() else text.lower()
-            for text in re.split('([0-9]+)', s)]
-
-sub_dirs = sorted([d for d in os.listdir(INPUT_IMAGE_DIR) if os.path.isdir(os.path.join(INPUT_IMAGE_DIR, d))], 
-                  key=natural_sort_key)
+sub_dirs = sorted([d for d in os.listdir(INPUT_IMAGE_DIR) if os.path.isdir(os.path.join(INPUT_IMAGE_DIR, d))])
 
 if len(sub_dirs) == 0:
     raise FileNotFoundError(f"在目录 {INPUT_IMAGE_DIR} 中未找到子文件夹")
@@ -294,18 +284,8 @@ print("✓ SD 1.5 基础模型加载完成")
 pipelines = {}
 
 def get_pipeline(mode):
-    global pipelines
     if mode in pipelines:
         return pipelines[mode]
-    
-    # 【显存优化】：加载新模型前，清理旧模型以释放空间
-    if pipelines:
-        print(f"  [显存优化] 清理旧模式 {list(pipelines.keys())} 以加载新模式 {mode}...")
-        pipelines.clear()
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
     
     # 获取对应的 name 变量
     name_var = f"{mode}_name"
@@ -313,10 +293,21 @@ def get_pipeline(mode):
         raise ValueError(f"未定义模式 {mode} 的名称变量 {name_var}")
     
     name = getattr(sys.modules[__name__], name_var)
-    scribble_path = os.path.join(CHECKPOINT_BASE.format(mode=mode, name=name), "controlnet_scribble")
-    tile_path = os.path.join(CHECKPOINT_BASE.format(mode=mode, name=name), "controlnet_tile")
+    ckpt_dir = CHECKPOINT_BASE.format(mode=mode, name=name)
+    scribble_path = os.path.join(ckpt_dir, "controlnet_scribble")
+    tile_path = os.path.join(ckpt_dir, "controlnet_tile")
+    lora_path = os.path.join(ckpt_dir, "unet_lora")
     
     print(f"  正在加载 {mode} 模型 (name: {name})...")
+    
+    # 若存在 UNet LoRA，则优先为当前 mode 加载对应 LoRA（仅影响 UNet 注意力层）
+    if os.path.isdir(lora_path):
+        print(f"  检测到 {mode} 的 UNet LoRA，小权重路径: {lora_path}")
+        try:
+            unet.load_attn_procs(lora_path)
+            print("  UNet LoRA 已加载，将在该模式推理中启用。")
+        except Exception as e:
+            print(f"  [警告] 加载 UNet LoRA 失败，将使用原始 UNet。错误: {e}")
     
     # 加载 ControlNet
     controlnet_scribble = ControlNetModel.from_pretrained(
@@ -396,7 +387,6 @@ def run_inference(img_pil, mode, prompt="", negative_prompt="", steps=30, cfg=7.
 
 # ============ 推理循环 ============
 print("\n开始推理...")
-print(f"  - 运行模式: {args.mode}")
 print(f"  - 子文件夹数量: {len(sub_dirs)}")
 print(f"  - 参数: scribble_scale={args.scribble_scale}, tile_scale={args.tile_scale}, cfg={args.cfg}, steps={args.steps}, seed={used_seed}\n")
 
@@ -405,72 +395,128 @@ processed_count = 0
 for sub_dir in sub_dirs:
     dir_path = os.path.join(INPUT_IMAGE_DIR, sub_dir)
     
-    # 查找原始图片和分割图
-    cf_img_path = os.path.join(dir_path, f"{sub_dir}_cf.png")
-    seg_img_path = os.path.join(dir_path, f"{sub_dir}_seg.png")
+    # 查找原始图片
+    img_files = glob.glob(os.path.join(dir_path, f"{sub_dir}_*.png"))
+    if not img_files:
+        print(f"  [跳过] 文件夹 {sub_dir} 中未找到匹配的原始图片")
+        continue
     
-    if not os.path.exists(cf_img_path):
-        print(f"  [跳过] 文件夹 {sub_dir} 中未找到 cf 图片: {cf_img_path}")
+    # 确定原始图片及其类型
+    # 编号_cf.png, 编号_fa.png, 编号_oct.png
+    real_img_path = None
+    img_type = None
+    
+    for f in img_files:
+        if f.endswith("_cf.png"):
+            real_img_path = f
+            img_type = "cf"
+            break
+        elif f.endswith("_fa.png"):
+            real_img_path = f
+            img_type = "fa"
+            break
+        elif f.endswith("_oct.png"):
+            real_img_path = f
+            img_type = "oct"
+            break
+            
+    if not real_img_path:
+        print(f"  [跳过] 文件夹 {sub_dir} 中未找到 cf/fa/oct 类型图片")
         continue
 
-    print(f"  [{processed_count+1}/{len(sub_dirs)}] 处理文件夹: {sub_dir}")
+    print(f"  [{processed_count+1}/{len(sub_dirs)}] 处理文件夹: {sub_dir} (类型: {img_type})")
     
     try:
-        # 1. 加载并处理原始 CF 图片
-        real_img_pil = Image.open(cf_img_path).convert("RGB")
-        # 预定义一个 cond_tile 用于裁剪，确保在只跑单模式时逻辑正确
-        cond_tile = None
+        # 加载原始图片
+        real_img_pil = Image.open(real_img_path).convert("RGB")
         
-        # 1.1 生成 FA
-        if args.mode in ["all", "cf2fa"]:
+        if img_type == "cf":
+            # 1. CF -> FA
             print(f"    -> 生成 FA...")
             fa_gen, _, cond_tile, mask = run_inference(real_img_pil, "cf2fa", args.prompt, args.negative_prompt, args.steps, args.cfg, used_seed)
             fa_gen.save(os.path.join(dir_path, f"{sub_dir}_fa_gen.png"))
             mask.save(os.path.join(dir_path, f"{sub_dir}_cf_mask.png"))
             # 保存输入网络的真实图 (512 尺寸)
             cond_tile.save(os.path.join(dir_path, f"{sub_dir}_cf_512.png"))
-        
-        # 1.2 生成 OCT
-        if args.mode in ["all", "cf2oct"]:
-            print(f"    -> 生成 OCT...")
-            oct_gen, _, tmp_tile, _ = run_inference(real_img_pil, "cf2oct", args.prompt, args.negative_prompt, args.steps, args.cfg, used_seed)
-            oct_gen.save(os.path.join(dir_path, f"{sub_dir}_oct_gen.png"))
-            if cond_tile is None: cond_tile = tmp_tile
-        
-        # 1.3 处理裁剪并生成 OCTA
-        if args.mode in ["all", "cf2octa"]:
-            print(f"    -> 生成 OCTA (裁剪 CF)...")
-            # 如果前面没跑，手动生成对齐训练逻辑的 cond_tile (灰度化并缩放)
-            if cond_tile is None:
-                tmp_pil = real_img_pil.convert("L").convert("RGB")
-                cond_tile = tmp_pil.resize((SIZE, SIZE), Image.BICUBIC)
             
+            # 2. CF -> OCT
+            print(f"    -> 生成 OCT...")
+            oct_gen, _, _, _ = run_inference(real_img_pil, "cf2oct", args.prompt, args.negative_prompt, args.steps, args.cfg, used_seed)
+            oct_gen.save(os.path.join(dir_path, f"{sub_dir}_oct_gen.png"))
+            
+            # 3. CF -> OCTA (需要裁剪)
+            print(f"    -> 生成 OCTA (裁剪 CF)...")
             # 使用已经resize到512的cond_tile进行裁剪
             cf_512_np = np.array(cond_tile)
-            cf_clip_np, (r_min, r_max, c_min, c_max) = get_max_inscribed_square(cf_512_np)
+            cf_clip_np = get_max_inscribed_square(cf_512_np)
             cf_clip_pil = Image.fromarray(cf_clip_np)
-            # cf_clip_pil.save(os.path.join(dir_path, f"{sub_dir}_cf_clip.png"))
+            cf_clip_pil.save(os.path.join(dir_path, f"{sub_dir}_cf_clip.png"))
             
-            # 同时对 seg 图进行相同的 resize 和裁剪
-            if os.path.exists(seg_img_path):
-                seg_img_pil = Image.open(seg_img_path).convert("L")
-                # 先 resize 到 512
-                seg_512_pil = seg_img_pil.resize((SIZE, SIZE), Image.NEAREST)
-                seg_512_np = np.array(seg_512_pil)
-                # 使用相同的坐标裁剪
-                seg_clip_np = seg_512_np[r_min:r_max, c_min:c_max]
-                # 将裁剪后的 seg 也 resize 到 512x512
-                seg_clip_pil = Image.fromarray(seg_clip_np).resize((SIZE, SIZE), Image.NEAREST)
-                seg_clip_pil.save(os.path.join(dir_path, f"{sub_dir}_seg_clip.png"))
-                print(f"    -> 已保存 seg_clip...")
-            else:
-                print(f"    [警告] 未找到分割图: {seg_img_path}")
-
             octa_gen, _, cond_tile_clip, clip_mask = run_inference(cf_clip_pil, "cf2octa", args.prompt, args.negative_prompt, args.steps, args.cfg, used_seed)
             octa_gen.save(os.path.join(dir_path, f"{sub_dir}_octa_gen.png"))
             clip_mask.save(os.path.join(dir_path, f"{sub_dir}_cf_clip_mask.png"))
             # 保存裁剪后的真实图 (512 尺寸)
             cond_tile_clip.save(os.path.join(dir_path, f"{sub_dir}_cf_clip_512.png"))
+            
+        elif img_type == "fa":
+            # 1. FA -> CF
+            print(f"    -> 生成 CF...")
+            cf_gen, _, cond_tile, mask = run_inference(real_img_pil, "fa2cf", args.prompt, args.negative_prompt, args.steps, args.cfg, used_seed)
+            cf_gen.save(os.path.join(dir_path, f"{sub_dir}_cf_gen.png"))
+            mask.save(os.path.join(dir_path, f"{sub_dir}_fa_mask.png"))
+            # 保存输入网络的真实图 (512 尺寸)
+            cond_tile.save(os.path.join(dir_path, f"{sub_dir}_fa_512.png"))
+            # 保存生成的 CF (已经是 512 尺寸)
+            cf_gen.save(os.path.join(dir_path, f"{sub_dir}_cf_gen_512.png"))
+            
+            # 2. FA -> OCT
+            print(f"    -> 生成 OCT...")
+            oct_gen, _, _, _ = run_inference(real_img_pil, "fa2oct", args.prompt, args.negative_prompt, args.steps, args.cfg, used_seed)
+            oct_gen.save(os.path.join(dir_path, f"{sub_dir}_oct_gen.png"))
+            
+            # 3. CF_gen -> OCTA (裁剪 CF_gen)
+            print(f"    -> 生成 OCTA (裁剪生成的 CF)...")
+            # cf_gen 已经是 512x512，直接裁剪
+            cf_gen_np = np.array(cf_gen)
+            cf_gen_clip_np = get_max_inscribed_square(cf_gen_np)
+            cf_gen_clip_pil = Image.fromarray(cf_gen_clip_np)
+            cf_gen_clip_pil.save(os.path.join(dir_path, f"{sub_dir}_cf_gen_clip.png"))
+            
+            octa_gen, _, cond_tile_clip, gen_clip_mask = run_inference(cf_gen_clip_pil, "cf2octa", args.prompt, args.negative_prompt, args.steps, args.cfg, used_seed)
+            octa_gen.save(os.path.join(dir_path, f"{sub_dir}_octa_gen.png"))
+            gen_clip_mask.save(os.path.join(dir_path, f"{sub_dir}_cf_gen_clip_mask.png"))
+            # 保存裁剪后输入网络的 CF_gen (512 尺寸)
+            cond_tile_clip.save(os.path.join(dir_path, f"{sub_dir}_cf_gen_clip_512.png"))
+            
+        elif img_type == "oct":
+            # 1. OCT -> CF
+            print(f"    -> 生成 CF...")
+            cf_gen, _, cond_tile, mask = run_inference(real_img_pil, "oct2cf", args.prompt, args.negative_prompt, args.steps, args.cfg, used_seed)
+            cf_gen.save(os.path.join(dir_path, f"{sub_dir}_cf_gen.png"))
+            mask.save(os.path.join(dir_path, f"{sub_dir}_oct_mask.png"))
+            # 保存输入网络的真实图 (512 尺寸)
+            cond_tile.save(os.path.join(dir_path, f"{sub_dir}_oct_512.png"))
+            # 保存生成的 CF (已经是 512 尺寸)
+            cf_gen.save(os.path.join(dir_path, f"{sub_dir}_cf_gen_512.png"))
+            
+            # 2. OCT -> FA
+            print(f"    -> 生成 FA...")
+            fa_gen, _, _, _ = run_inference(real_img_pil, "oct2fa", args.prompt, args.negative_prompt, args.steps, args.cfg, used_seed)
+            fa_gen.save(os.path.join(dir_path, f"{sub_dir}_fa_gen.png"))
+            
+            # 3. CF_gen -> OCTA (裁剪 CF_gen)
+            print(f"    -> 生成 OCTA (裁剪生成的 CF)...")
+            # cf_gen 已经是 512x512，直接裁剪
+            cf_gen_np = np.array(cf_gen)
+            cf_gen_clip_np = get_max_inscribed_square(cf_gen_np)
+            cf_gen_clip_pil = Image.fromarray(cf_gen_clip_np)
+            cf_gen_clip_pil.save(os.path.join(dir_path, f"{sub_dir}_cf_gen_clip.png"))
+            
+            octa_gen, _, cond_tile_clip, gen_clip_mask = run_inference(cf_gen_clip_pil, "cf2octa", args.prompt, args.negative_prompt, args.steps, args.cfg, used_seed)
+            octa_gen.save(os.path.join(dir_path, f"{sub_dir}_octa_gen.png"))
+            gen_clip_mask.save(os.path.join(dir_path, f"{sub_dir}_cf_gen_clip_mask.png"))
+            # 保存裁剪后输入网络的 CF_gen (512 尺寸)
+            cond_tile_clip.save(os.path.join(dir_path, f"{sub_dir}_cf_gen_clip_512.png"))
             
         processed_count += 1
         

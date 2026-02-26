@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-SDXL ControlNet 测试与评估脚本 v15
-基于 v14 逻辑重构，支持自动指标计算和可视化结果生成。
+SDXL ControlNet 测试与评估脚本 v21
+对齐 v21 训练脚本的模型结构（UNet LoRA + 医学 Prompt）
 
-【核心变动】
-1. 移除 CSV 依赖：直接从 dataset 加载测试集样本（已完成配准和筛选）。
-2. 血管图生成：在推理前实时提取血管图作为 Scribble ControlNet 条件。
-3. 智能黑边处理：集成 mask_gen 逻辑，自动去除推理结果中的背景噪声。
-4. 全面指标评估：支持 PSNR, MS-SSIM 以及基于全集的 FID 和 Inception Score。
-5. 棋盘对比图：自动生成 512x512 的棋盘交替对比图。
+【v21 核心变动】
+1. 支持加载 UNet LoRA 权重（使用 PEFT 库）
+2. 使用医学图像领域特定的 Prompt（与训练时一致）
+3. 保持其他功能：血管图生成、黑边处理、全面指标评估、棋盘对比图
 """
 
 import os
@@ -22,6 +20,7 @@ from diffusers import (StableDiffusionControlNetPipeline, ControlNetModel,
                        DDPMScheduler, AutoencoderKL, UNet2DConditionModel,
                        MultiControlNetModel)
 from transformers import CLIPTextModel, CLIPTokenizer
+from peft import PeftModel  # 【v21新增】用于加载 UNet LoRA
 
 # 导入评估与辅助模块
 import measurement2  # PSNR, MS-SSIM, FID, IS
@@ -106,6 +105,19 @@ def calculate_brightness_ratio(pred, gt):
     ratio = pred_brightness / gt_brightness if gt_brightness > 0 else 0
     return pred_brightness, gt_brightness, ratio
 
+def get_medical_prompt(mode):
+    """
+    【v21新增】获取医学图像领域特定的 Prompt（与训练时一致）
+    """
+    if 'fa' in mode:
+        return "fluorescein angiography, retinal fundus vessel, medical imaging, high contrast, monochrome"
+    elif 'oct' in mode:
+        return "optical coherence tomography, retinal cross section, medical scan, grayscale"
+    elif 'cf' in mode:
+        return "color fundus photography, retinal image, medical photography"
+    else:
+        return "medical retinal imaging"
+
 # ============ 2. 主推理流程 ============
 
 def main():
@@ -156,22 +168,66 @@ def main():
     logger.info(f"开始测试实验: {args.name} | 模式: {args.mode} | 权重: {args.step}")
     logger.info(f"结果保存目录: {out_dir}")
     logger.info(f"日志保存路径: {log_path}")
+    logger.info(f"【v21 特性】支持 UNet LoRA + 医学图像 Prompt")
     # ================================
 
     device = torch.device("cuda")
     
     # 1. 加载模型组件
     logger.info(f"正在加载模型 checkpoint: {ckpt_path}")
+    
+    # 加载 ControlNet
     cn_s = ControlNetModel.from_pretrained(os.path.join(ckpt_path, "controlnet_scribble")).to(device)
     cn_t = ControlNetModel.from_pretrained(os.path.join(ckpt_path, "controlnet_tile")).to(device)
     
-    pipe = StableDiffusionControlNetPipeline.from_pretrained(
-        base_model_dir,
-        controlnet=MultiControlNetModel([cn_s, cn_t]),
-        torch_dtype=torch.float32,
-        safety_checker=None
+    # 加载基础 SD1.5 模型
+    logger.info(f"正在加载基础 SD1.5 模型...")
+    tokenizer = CLIPTokenizer.from_pretrained(base_model_dir, subfolder="tokenizer")
+    text_encoder = CLIPTextModel.from_pretrained(base_model_dir, subfolder="text_encoder").to(device)
+    vae = AutoencoderKL.from_pretrained(base_model_dir, subfolder="vae").to(device)
+    unet = UNet2DConditionModel.from_pretrained(base_model_dir, subfolder="unet").to(device)
+    scheduler = DDPMScheduler.from_pretrained(base_model_dir, subfolder="scheduler")
+    
+    # 【v21核心】尝试加载 UNet LoRA 权重
+    lora_dir = os.path.join(ckpt_path, "unet_lora")
+    unet_for_pipe = unet  # 默认使用原始 UNet
+    
+    if os.path.isdir(lora_dir):
+        logger.info(f"✓ 检测到 UNet LoRA 权重: {lora_dir}")
+        try:
+            # 使用 PEFT 加载 LoRA 适配器
+            unet_lora = PeftModel.from_pretrained(unet, lora_dir)
+            logger.info("✓ UNet LoRA 加载成功，已启用医学图像域适配")
+            
+            # 打印 LoRA 信息
+            trainable_params = sum(p.numel() for p in unet_lora.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in unet_lora.parameters())
+            logger.info(f"  - LoRA 可训练参数: {trainable_params:,} ({trainable_params/1e6:.2f}M)")
+            logger.info(f"  - 参数占比: {trainable_params/total_params*100:.2f}%")
+            
+            # 【关键修复】使用 base_model 访问底层 UNet，避免 PEFT 包装器的 forward 方法冲突
+            unet_for_pipe = unet_lora.base_model
+            logger.info("✓ 使用 UNet LoRA 的 base_model（避免 PEFT wrapper 冲突）")
+        except Exception as e:
+            logger.warning(f"⚠ UNet LoRA 加载失败，回退到原始 UNet。错误: {e}")
+            unet_for_pipe = unet
+    else:
+        logger.info("ℹ 未检测到 UNet LoRA 权重，使用原始 SD1.5 UNet")
+    
+    # 构建 Pipeline
+    multi_controlnet = MultiControlNetModel([cn_s, cn_t])
+    pipe = StableDiffusionControlNetPipeline(
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        unet=unet_for_pipe,  # 使用 base_model（如果有 LoRA）或原始 UNet
+        controlnet=multi_controlnet,
+        scheduler=scheduler,
+        safety_checker=None,
+        feature_extractor=None
     ).to(device)
-    pipe.scheduler = DDPMScheduler.from_pretrained(base_model_dir, subfolder="scheduler")
+    
+    logger.info("✓ Pipeline 构建完成")
     
     # 2. 加载数据集 (对齐 train.py)
     if 'cf' in args.mode and 'fa' in args.mode:
@@ -200,13 +256,16 @@ def main():
     scribble_scale = 0.8
     tile_scale = 1.0
     
+    # 【v21新增】获取医学图像 Prompt（与训练时一致）
+    medical_prompt = get_medical_prompt(args.mode)
+    logger.info(f"使用医学 Prompt: \"{medical_prompt}\"")
+    
     for i, batch in enumerate(loader):
         cond_tile, tgt, cp, tp = batch
         cond_tile = cond_tile.to(device)
         idx = os.path.basename(cp[0]).split('.')[0]
         
         # 实时生成 Scribble 输入
-        # 【v19修正】cond_tile 现在是 [-1, 1] 范围
         source_type, _ = args.mode.split('2')
         with torch.no_grad():
             cond_tile_01 = (cond_tile + 1) / 2  # [-1, 1] → [0, 1]
@@ -215,11 +274,10 @@ def main():
 
         # 执行推理
         generator = torch.Generator(device=device).manual_seed(args.seed)
-        # 获取图像尺寸
         h, w = cond_tile.shape[2], cond_tile.shape[3]
         
         output = pipe(
-            prompt="", 
+            prompt=medical_prompt,  # 【v21改进】使用医学图像 Prompt
             image=[cond_scribble, cond_tile], 
             num_inference_steps=30, 
             controlnet_conditioning_scale=[scribble_scale, tile_scale],
@@ -231,17 +289,16 @@ def main():
         # 后处理与保存
         pred_np = np.array(output)
         gt_np = ((tgt[0].cpu().numpy().transpose(1, 2, 0) + 1) / 2 * 255).astype(np.uint8)
-        # 【v19修正】cond_tile 现在是 [-1, 1] 范围
         tile_np = ((cond_tile[0].cpu().numpy().transpose(1, 2, 0) + 1) / 2 * 255).astype(np.uint8)
         
         logger.debug(f"[Debug] pred 范围: [{pred_np.min()}, {pred_np.max()}], 均值: {pred_np.mean():.2f}")
         logger.debug(f"[Debug] gt 范围: [{gt_np.min()}, {gt_np.max()}], 均值: {gt_np.mean():.2f}")
         logger.debug(f"[Debug] tile 范围: [{tile_np.min()}, {tile_np.max()}], 均值: {tile_np.mean():.2f}")
-
+        
         # 计算亮度比值
         pred_brightness, gt_brightness, brightness_ratio = calculate_brightness_ratio(pred_np, gt_np)
         logger.info(f"[亮度比值] pred平均亮度: {pred_brightness:.2f}, gt平均亮度: {gt_brightness:.2f}, 比值(pred/gt): {brightness_ratio:.4f}")
-        
+       
         # 应用黑边蒙版（基于 tile 输入）- 仅用于保存可视化图像
         mask = mask_gen(tile_np)
         pred_masked = (pred_np * np.stack([mask]*3, axis=-1)).astype(np.uint8)
@@ -249,12 +306,23 @@ def main():
         # 创建单样本目录
         sample_dir = os.path.join(out_dir, idx)
         os.makedirs(sample_dir, exist_ok=True)
+        
+        # 保存单独图像
         Image.fromarray(pred_masked).save(os.path.join(sample_dir, "pred.png"))
         Image.fromarray(gt_np).save(os.path.join(sample_dir, "target.png"))
+        Image.fromarray(tile_np).save(os.path.join(sample_dir, "input_tile.png"))
         
-        # 生成对比棋盘图
-        chess = chessboard_gen_512(pred_masked, gt_np)
-        Image.fromarray(chess).save(os.path.join(sample_dir, "chessboard.png"))
+        # 【v21增强】生成两种对比棋盘图
+        # 1. pred vs gt (预测 vs 真实目标) - 评估生成质量
+        chess_pred_gt = chessboard_gen_512(pred_masked, gt_np)
+        Image.fromarray(chess_pred_gt).save(os.path.join(sample_dir, "chessboard_pred_vs_gt.png"))
+        
+        # 2. pred vs tile (预测 vs 输入条件) - 查看转换效果
+        chess_pred_tile = chessboard_gen_512(pred_masked, tile_np)
+        Image.fromarray(chess_pred_tile).save(os.path.join(sample_dir, "chessboard_pred_vs_tile.png"))
+        
+        # 保留原有的 chessboard.png（pred vs gt）以兼容旧版本
+        Image.fromarray(chess_pred_gt).save(os.path.join(sample_dir, "chessboard.png"))
         
         # 计算 PSNR/SSIM
         psnr_val = measurement2.calculate_psnr(pred_np, gt_np, data_range=255)

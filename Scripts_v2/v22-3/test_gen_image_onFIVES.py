@@ -1,6 +1,11 @@
 """
-模型测试脚本 - 对指定目录下的所有图片进行推理
+模型测试脚本 v21 - 对指定目录下的所有图片进行推理
+对齐 v21 训练架构：UNet LoRA + 医学图像 Prompt
 
+【v21 核心改进】
+1. 支持加载 UNet LoRA 权重（使用 PEFT 库）
+2. 使用医学图像领域特定的 Prompt（与训练时一致）
+3. 正确处理 PEFT 包装的 UNet（使用 base_model）
 """
 
 import os
@@ -19,6 +24,7 @@ from diffusers import (StableDiffusionControlNetPipeline, ControlNetModel,
                        MultiControlNetModel)
 from transformers import CLIPTextModel, CLIPTokenizer
 from torchvision import transforms
+from peft import PeftModel  # 【v21新增】用于加载 UNet LoRA
 
 # 导入 v15 本地的血管提取模块
 from vessle_detector import extract_vessel_map
@@ -26,14 +32,33 @@ from vessle_detector import extract_vessel_map
 # 定义模型输入尺寸
 SIZE = 512
 
+def get_medical_prompt(mode):
+    """
+    【v21新增】获取医学图像领域特定的 Prompt（与训练时一致）
+    """
+    if 'fa' in mode:
+        return "fluorescein angiography, retinal fundus vessel, medical imaging, high contrast, monochrome"
+    elif 'oct' in mode:
+        return "optical coherence tomography, retinal cross section, medical scan, grayscale"
+    elif 'cf' in mode:
+        return "color fundus photography, retinal image, medical photography"
+    elif 'octa' in mode:
+        return "optical coherence tomography angiography, retinal vasculature, medical imaging"
+    else:
+        return "medical retinal imaging"
+
 def generate_controlnet_inputs_v15(img_pil, mode):
-    """支持所有模式的 ControlNet 输入生成 (对齐 v15 逻辑)"""
+    """支持所有模式的 ControlNet 输入生成 (对齐 v21 训练逻辑)"""
     # 确定图像类型
     source_type = mode.split('2')[0]
     
-    # 【对齐要求】任何时候 CF 图输入网络（作为条件图）都应该是灰度图
-    if source_type == 'cf':
-        img_pil = img_pil.convert("L").convert("RGB")
+    # 【v21修正】保持 CF 图的原始 RGB，与训练时的 dataset 一致
+    # 训练时使用彩色 CF 图，推理时也应该使用彩色 CF 图
+    # if source_type == 'cf':
+    #     img_pil = img_pil.convert("L").convert("RGB")
+    
+    # 确保是 RGB 格式（但不强制灰度化）
+    img_pil = img_pil.convert("RGB")
         
     # 1. 先 resize 到 512×512
     cond_tile_pil = img_pil.resize((SIZE, SIZE), Image.BICUBIC)
@@ -58,14 +83,15 @@ def generate_controlnet_inputs_v15(img_pil, mode):
 
 # ============ 配置变量（在程序开头指定）============
 # 1. 目标图片路径（待推理的图片目录）
-INPUT_IMAGE_DIR = "/data/student/Fengjunming/SDXL_ControlNet/data/FIVES_extract_v5"
+INPUT_IMAGE_DIR = "/data/student/Fengjunming/SDXL_ControlNet/data/FIVES_extract_v7"
 
 # 2. SD15模型和ControlNet模型路径（多模态）
 BASE_MODEL_DIR = "/data/student/Fengjunming/SDXL_ControlNet/models/sd15-diffusers"
 
 # 各模态转换模型名称 (对应 results/out_ctrl_sd15_dual/[mode]/[name]/best_checkpoint)
 #cf2fa_name = "260128_2" #1.28已修改
-cf2fa_name = "260213_1"
+#cf2fa_name = "260215_1_lora"
+cf2fa_name = "260218_3_Hfrequency"
 fa2cf_name = "260115_3"
 cf2oct_name = "260116_1"
 oct2cf_name = "260116_1"
@@ -313,10 +339,37 @@ def get_pipeline(mode):
         raise ValueError(f"未定义模式 {mode} 的名称变量 {name_var}")
     
     name = getattr(sys.modules[__name__], name_var)
-    scribble_path = os.path.join(CHECKPOINT_BASE.format(mode=mode, name=name), "controlnet_scribble")
-    tile_path = os.path.join(CHECKPOINT_BASE.format(mode=mode, name=name), "controlnet_tile")
+    ckpt_dir = CHECKPOINT_BASE.format(mode=mode, name=name)
+    scribble_path = os.path.join(ckpt_dir, "controlnet_scribble")
+    tile_path = os.path.join(ckpt_dir, "controlnet_tile")
+    lora_path = os.path.join(ckpt_dir, "unet_lora")
     
     print(f"  正在加载 {mode} 模型 (name: {name})...")
+    
+    # 【v21核心】优先加载 UNet LoRA（如果存在）
+    unet_for_pipe = unet  # 默认使用原始 UNet
+    
+    if os.path.isdir(lora_path):
+        print(f"  ✓ 检测到 {mode} 的 UNet LoRA: {lora_path}")
+        try:
+            # 使用 PEFT 加载 LoRA 适配器
+            unet_lora = PeftModel.from_pretrained(unet, lora_path)
+            print(f"  ✓ UNet LoRA 加载成功")
+            
+            # 打印 LoRA 参数信息
+            trainable_params = sum(p.numel() for p in unet_lora.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in unet_lora.parameters())
+            print(f"    - LoRA 可训练参数: {trainable_params:,} ({trainable_params/1e6:.2f}M)")
+            print(f"    - 参数占比: {trainable_params/total_params*100:.2f}%")
+            
+            # 【关键修复】使用 base_model 避免 PEFT wrapper 冲突
+            unet_for_pipe = unet_lora.base_model
+            print(f"  ✓ 使用 UNet LoRA 的 base_model（避免 PEFT wrapper 冲突）")
+        except Exception as e:
+            print(f"  ⚠ 加载 UNet LoRA 失败，将使用原始 UNet。错误: {e}")
+            unet_for_pipe = unet
+    else:
+        print(f"  ℹ 未检测到 UNet LoRA，使用原始 SD1.5 UNet")
     
     # 加载 ControlNet
     controlnet_scribble = ControlNetModel.from_pretrained(
@@ -336,12 +389,12 @@ def get_pipeline(mode):
     # 组合 MultiControlNet
     multi_controlnet = MultiControlNetModel([controlnet_scribble, controlnet_tile])
     
-    # 创建 Pipeline
+    # 创建 Pipeline（使用 base_model 如果有 LoRA）
     pipe = StableDiffusionControlNetPipeline(
         vae=vae,
         text_encoder=text_encoder,
         tokenizer=tokenizer,
-        unet=unet,
+        unet=unet_for_pipe,  # 使用 base_model（如果有 LoRA）或原始 UNet
         controlnet=multi_controlnet,
         scheduler=noise_scheduler,
         safety_checker=None,
@@ -355,6 +408,7 @@ def get_pipeline(mode):
         pipe.vae.enable_tiling()
     
     pipelines[mode] = pipe
+    print(f"  ✓ {mode} Pipeline 构建完成")
     return pipe
 
 print("✓ 所有模型加载完成")
@@ -364,6 +418,11 @@ print("✓ 所有模型加载完成")
 def run_inference(img_pil, mode, prompt="", negative_prompt="", steps=30, cfg=7.5, seed=None):
     pipe = get_pipeline(mode)
     generator = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
+    
+    # 【v21改进】如果用户没有提供 prompt，使用医学图像领域特定的 prompt
+    if not prompt:
+        prompt = get_medical_prompt(mode)
+        print(f"    使用医学 Prompt: \"{prompt[:50]}...\"")
     
     # 生成 ControlNet 条件图 (使用 v15 版本的函数)
     # 内部已包含 resize 到 SIZE (512) 的逻辑，对齐 train.py 实际使用的数据集尺寸
@@ -396,9 +455,15 @@ def run_inference(img_pil, mode, prompt="", negative_prompt="", steps=30, cfg=7.
 
 # ============ 推理循环 ============
 print("\n开始推理...")
+print(f"  - 【v21 特性】支持 UNet LoRA + 医学图像 Prompt")
 print(f"  - 运行模式: {args.mode}")
 print(f"  - 子文件夹数量: {len(sub_dirs)}")
-print(f"  - 参数: scribble_scale={args.scribble_scale}, tile_scale={args.tile_scale}, cfg={args.cfg}, steps={args.steps}, seed={used_seed}\n")
+print(f"  - 参数: scribble_scale={args.scribble_scale}, tile_scale={args.tile_scale}, cfg={args.cfg}, steps={args.steps}, seed={used_seed}")
+if args.prompt:
+    print(f"  - 用户自定义 Prompt: \"{args.prompt}\"")
+else:
+    print(f"  - 将使用医学图像领域特定的 Prompt (根据模式自动选择)")
+print()
 
 processed_count = 0
 
@@ -440,9 +505,9 @@ for sub_dir in sub_dirs:
         # 1.3 处理裁剪并生成 OCTA
         if args.mode in ["all", "cf2octa"]:
             print(f"    -> 生成 OCTA (裁剪 CF)...")
-            # 如果前面没跑，手动生成对齐训练逻辑的 cond_tile (灰度化并缩放)
+            # 如果前面没跑，手动生成对齐训练逻辑的 cond_tile（保持彩色并缩放）
             if cond_tile is None:
-                tmp_pil = real_img_pil.convert("L").convert("RGB")
+                tmp_pil = real_img_pil.convert("RGB")  # 【v21修正】保持彩色
                 cond_tile = tmp_pil.resize((SIZE, SIZE), Image.BICUBIC)
             
             # 使用已经resize到512的cond_tile进行裁剪

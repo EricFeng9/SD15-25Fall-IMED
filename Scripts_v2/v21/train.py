@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-SDXL ControlNet 训练脚本 v15
-基于 v14 逻辑重构，支持 CF-FA 和 CF-OCT 数据集。
+SDXL ControlNet 训练脚本 v21
+基于 v18 改进，专注解决"结构好但纹理/亮度不真实"问题
 
-【核心变动】
-1. 移除 CSV 依赖：直接从指定目录读取配对图像。
-2. 移除 CF-OCTA：专注于 CF-FA 和 CF-OCT 任务。
-3. 动态血管提取：Dataset 不再返回 vessel 图，由训练循环调用 vessle_detector 实时生成。
-4. 继承 v14 逻辑：保留 MSE + MS-SSIM + Vessel Dice + Gradient Match Loss 组合。
-5. 完备的训练策略：包括早停机制（Early Stopping）、学习率衰减、固定子集验证。
+【核心变动 - 针对视觉图灵测试】
+1. ✅ UNet LoRA 训练：让 UNet 学习医学图像的纹理和亮度分布（v18 中 UNet 被冻结）
+2. ✅ 移除所有像素级损失：只保留纯粹的噪声预测 MSE（移除 SSIM/Vessel/Gradient/Texture Loss）
+3. ✅ 医学图像 Prompt：使用领域特定的 prompt 而不是空字符串
+4. ✅ Offset Noise：解决亮度偏亮、对比度不足的问题
+5. ✅ 同时训练 ControlNet + UNet LoRA，各司其职（结构 vs 纹理）
 """
 
 import os
-import csv
 import math
 import time
 import random
@@ -28,8 +27,9 @@ from torchvision import transforms
 from diffusers import (DDPMScheduler, ControlNetModel, AutoencoderKL, UNet2DConditionModel, 
                        StableDiffusionControlNetPipeline, MultiControlNetModel)
 from transformers import CLIPTextModel, CLIPTokenizer
-from pytorch_msssim import MS_SSIM
+from peft import LoraConfig, get_peft_model, TaskType
 #import bitsandbytes as bnb
+
 # 导入自定义模块
 import sys
 # 将数据目录加入路径以便导入 dataset
@@ -55,63 +55,29 @@ OUT_ROOT = "/data/student/Fengjunming/SDXL_ControlNet/results/out_ctrl_sd15_dual
 
 # ============ 1. 辅助函数 ============
 
-def get_prompt_embeds(bs, tokenizer, text_encoder):
-    """生成空提示词的文本嵌入"""
-    prompts = [""] * bs
-    inputs = tokenizer(prompts, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").to(DEVICE)
+def get_prompt_embeds(bs, tokenizer, text_encoder, mode="cf2fa"):
+    """
+    生成医学图像领域特定的提示词嵌入
+    
+    【v21 改进】不再使用空 prompt，而是使用领域特定描述
+    这有助于激活模型中与医学影像相关的潜在语义分布
+    """
+    if 'fa' in mode:
+        # FA (荧光血管造影) 的特征：高对比度、黑背景、亮血管、颗粒噪声
+        prompt = "fluorescein angiography, retinal fundus vessel, medical imaging, high contrast, monochrome"
+    elif 'oct' in mode:
+        # OCT 的特征：层状结构、灰度图
+        prompt = "optical coherence tomography, retinal cross section, medical scan, grayscale"
+    elif 'cf' in mode:
+        # CF (彩色眼底) 的特征：彩色、自然光照
+        prompt = "color fundus photography, retinal image, medical photography"
+    else:
+        prompt = "medical retinal imaging"
+    
+    prompts = [prompt] * bs
+    inputs = tokenizer(prompts, padding="max_length", max_length=tokenizer.model_max_length, 
+                       truncation=True, return_tensors="pt").to(DEVICE)
     return text_encoder(inputs.input_ids)[0]
-
-def compute_image_gradients(image):
-    """计算图像的 Sobel 梯度（用于梯度匹配损失）"""
-    kernel_x = torch.tensor([[1., 0., -1.], [2., 0., -2.], [1., 0., -1.]], device=DEVICE).view(1, 1, 3, 3).expand(image.shape[1], 1, 3, 3)
-    kernel_y = torch.tensor([[1., 2., 1.], [0., 0., 0.], [-1., -2., -1.]], device=DEVICE).view(1, 1, 3, 3).expand(image.shape[1], 1, 3, 3)
-    grad_x = F.conv2d(image, kernel_x, padding=1, groups=image.shape[1])
-    grad_y = F.conv2d(image, kernel_y, padding=1, groups=image.shape[1])
-    return grad_x, grad_y
-
-def compute_gradient_match_loss(pred, gt):
-    """梯度匹配损失：约束预测图与 GT 在边缘空间的一致性"""
-    pred_gray = pred[:, 1:2, :, :] # 使用绿色通道
-    gt_gray = gt[:, 1:2, :, :]
-    px, py = compute_image_gradients(pred_gray)
-    gx, gy = compute_image_gradients(gt_gray)
-    return F.l1_loss(px, gx) + F.l1_loss(py, gy)
-
-def gaussian_blur(img, kernel_size=7, sigma=1.5):
-    """
-    对图像做可微分的高斯模糊，用于分离低频/高频分量
-    img: (B, C, H, W)，数值范围约 [0, 1]
-    """
-    channels = img.shape[1]
-    device = img.device
-    dtype = img.dtype
-    
-    # 1D 高斯核
-    x = torch.arange(kernel_size, device=device, dtype=dtype) - kernel_size // 2
-    gauss = torch.exp(-0.5 * (x / sigma) ** 2)
-    gauss = gauss / gauss.sum()
-    
-    kernel_x = gauss.view(1, 1, 1, -1)   # (1,1,1,K)
-    kernel_y = gauss.view(1, 1, -1, 1)   # (1,1,K,1)
-    
-    # 组卷积：每个通道使用同一个核
-    img = F.conv2d(img, kernel_x.expand(channels, 1, 1, -1),
-                   padding=(0, kernel_size // 2), groups=channels)
-    img = F.conv2d(img, kernel_y.expand(channels, 1, -1, 1),
-                   padding=(kernel_size // 2, 0), groups=channels)
-    return img
-
-def compute_texture_loss(pred_01, gt_01):
-    """
-    高频纹理匹配损失：
-    先用高斯模糊分离出低频，再对高频残差 (原图-低频) 做 L1 约束，
-    鼓励模型学习 FA 的噪声/纹理统计，而不是全部抹平。
-    """
-    pred_blur = gaussian_blur(pred_01, kernel_size=7, sigma=1.5)
-    gt_blur   = gaussian_blur(gt_01,   kernel_size=7, sigma=1.5)
-    pred_hf = pred_01 - pred_blur
-    gt_hf   = gt_01   - gt_blur
-    return F.l1_loss(pred_hf, gt_hf)
 
 def get_dynamic_lr(step, max_steps, base_lr=5e-5, min_lr=1e-5):
     """余弦退火学习率衰减"""
@@ -121,63 +87,27 @@ def get_dynamic_lr(step, max_steps, base_lr=5e-5, min_lr=1e-5):
 
 # ============ 2. 核心损失计算 ============
 
-def compute_total_loss(noise_pred, noise, noisy_latents, latents, timesteps, vae, noise_scheduler, msssim_fn, args):
-    """计算综合损失：MSE + MS-SSIM + Vessel Dice + Gradient + Texture"""
-    # 1. 噪声空间 MSE 损失
-    loss_mse = F.mse_loss(noise_pred, noise)
+def compute_total_loss(noise_pred, noise):
+    """
+    【v21 核心改进】纯粹的噪声预测损失
     
-    # 从噪声预测中恢复图像 (x0 预测)
-    alphas = noise_scheduler.alphas_cumprod.to(DEVICE)
-    at = alphas[timesteps].view(-1, 1, 1, 1)
-    pred_x0_latents = (noisy_latents - (1 - at).sqrt() * noise_pred) / at.sqrt()
-    
-    # 解码到像素空间 [-1, 1]
-    pred_imgs = vae.decode(pred_x0_latents / vae.config.scaling_factor).sample
-    with torch.no_grad():
-        gt_imgs = vae.decode(latents / vae.config.scaling_factor).sample
-    
-    pred_01 = (pred_imgs.clamp(-1, 1) + 1) / 2
-    gt_01 = (gt_imgs.clamp(-1, 1) + 1) / 2
-    
-    # 2. MS-SSIM 损失
-    loss_msssim = 1 - msssim_fn(pred_01, gt_01) if args.msssim_lambda > 0 else torch.tensor(0.0).to(DEVICE)
-    
-    # 3. 血管结构损失 (Dice Loss)
-    source_type, target_type = args.mode.split('2')
-    pred_vessel = extract_vessel_map(pred_01, target_type, args.mode)
-    with torch.no_grad():
-        gt_vessel = extract_vessel_map(gt_01, target_type, args.mode)
-        # 【重要】训练时使用连续血管响应图，不使用 Otsu 二值化
-        # Otsu 二值化会导致训练不稳定（每个样本阈值不同，损失尺度不一致）
-        # Otsu 仅在推理/评估时使用，用于计算二值化的 Dice 指标
-    
-    smooth = 1e-5
-    # 使用连续响应图计算 Dice，保持梯度平滑和训练稳定
-    intersection = (pred_vessel * gt_vessel).sum()
-    dice_coeff = (2.0 * intersection + smooth) / (pred_vessel.sum() + gt_vessel.sum() + smooth)
-    loss_vessel = 1.0 - dice_coeff
-    
-    # 4. 梯度匹配损失
-    loss_grad = compute_gradient_match_loss(pred_01, gt_01)
-
-    # 5. 高频纹理损失
-    loss_tex = compute_texture_loss(pred_01, gt_01) if args.texture_lambda > 0 else torch.tensor(0.0).to(DEVICE)
-    
-    # 组合总损失
-    total_loss = (
-        loss_mse
-        + args.msssim_lambda * loss_msssim
-        + args.vessel_lambda * loss_vessel
-        + args.grad_lambda * loss_grad
-        + args.texture_lambda * loss_tex
-    )
-    return total_loss, loss_mse, loss_msssim, loss_vessel, loss_grad, loss_tex
+    移除所有像素级约束（SSIM/Vessel/Gradient/Texture），让模型自由学习纹理
+    原因：
+    1. Diffusion 模型的本质是概率生成，应该通过噪声分布学习，而非像素回归
+    2. 像素级 L1/L2 会导致"回归均值"效应，生成过于平滑的结果
+    3. UNet LoRA 会学习到正确的纹理分布，不需要显式约束
+    """
+    return F.mse_loss(noise_pred, noise)
 
 # ============ 3. 验证与早停逻辑 ============
 
-def evaluate(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, msssim_fn, tokenizer, text_encoder, args):
-    """在固定验证集上评估模型：使用与训练一致的综合损失(含 texture)"""
+def evaluate(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, tokenizer, text_encoder, args):
+    """【v21简化】在固定验证集上评估模型：只使用 MSE loss"""
     cn_s.eval(); cn_t.eval()
+    # 如果 unet 是 PEFT 包装的，也要设置为 eval（虽然已经冻结，但保持一致性）
+    if hasattr(unet, 'eval'):
+        unet.eval()
+    
     val_losses = []
     with torch.no_grad():
         for batch in val_loader:
@@ -186,7 +116,6 @@ def evaluate(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, msssim_fn, toke
             b = tgt.shape[0]
             
             # 实时提取血管图作为 Scribble 输入
-            # 【v19修正】cond_tile 现在是 [-1, 1] 范围
             source_type, _ = args.mode.split('2')
             cond_tile_01 = (cond_tile + 1) / 2  # [-1, 1] → [0, 1]
             vessel_map = extract_vessel_map(cond_tile_01, source_type, args.mode)
@@ -197,30 +126,41 @@ def evaluate(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, msssim_fn, toke
             noise = torch.randn_like(latents)
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (b,), device=DEVICE).long()
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-            prompt_embeds = get_prompt_embeds(b, tokenizer, text_encoder)
+            prompt_embeds = get_prompt_embeds(b, tokenizer, text_encoder, args.mode)
             
             # ControlNet 推理
-            # 【v19修正】cond_tile 现在是 [-1, 1] 范围，符合 ControlNet 预训练假设
             down_s, mid_s = cn_s(noisy_latents, timesteps, prompt_embeds, cond_scribble, args.scribble_scale, return_dict=False)
             down_t, mid_t = cn_t(noisy_latents, timesteps, prompt_embeds, cond_tile, args.tile_scale, return_dict=False)
             
-            noise_pred = unet(noisy_latents, timesteps, prompt_embeds, 
-                              down_block_additional_residuals=[s+t for s,t in zip(down_s, down_t)],
-                              mid_block_additional_residual=mid_s+mid_t).sample
+            # UNet 预测（如果是 PEFT 包装的，使用 base_model）
+            if hasattr(unet, 'base_model'):
+                noise_pred = unet.base_model(
+                    sample=noisy_latents,
+                    timestep=timesteps,
+                    encoder_hidden_states=prompt_embeds,
+                    down_block_additional_residuals=[s+t for s,t in zip(down_s, down_t)],
+                    mid_block_additional_residual=mid_s+mid_t,
+                    return_dict=False
+                )[0]
+            else:
+                noise_pred = unet(
+                    noisy_latents, timesteps, prompt_embeds,
+                    down_block_additional_residuals=[s+t for s,t in zip(down_s, down_t)],
+                    mid_block_additional_residual=mid_s+mid_t
+                ).sample
             
-            # 使用与训练一致的综合损失作为验证指标（包含纹理/血管/梯度等）
-            total_loss, _, _, _, _, _ = compute_total_loss(
-                noise_pred, noise, noisy_latents, latents, timesteps,
-                vae, noise_scheduler, msssim_fn, args
-            )
-            val_losses.append(total_loss.item())
+            # 使用简化的 MSE 损失
+            loss = compute_total_loss(noise_pred, noise)
+            val_losses.append(loss.item())
             
     cn_s.train(); cn_t.train()
+    if hasattr(unet, 'train'):
+        unet.train()
     torch.cuda.empty_cache()
     return np.mean(val_losses)
 
 def visualize_inference(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, tokenizer, text_encoder, args, step, out_dir):
-    """运行全量推理并保存可视化结果 (对齐 v14)"""
+    """【v21优化】运行推理并保存可视化结果"""
     print(f"\n[可视化] 正在运行推理可视化 (Step {step})...")
     
     # 创建推理测试目录
@@ -230,13 +170,24 @@ def visualize_inference(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, toke
     # 临时切换到 eval 模式
     cn_s.eval(); cn_t.eval()
     
-    # 构建 pipeline
+    # 确定使用的 prompt
+    if 'fa' in args.mode:
+        prompt = "fluorescein angiography, retinal fundus vessel, medical imaging, high contrast, monochrome"
+    elif 'oct' in args.mode:
+        prompt = "optical coherence tomography, retinal cross section, medical scan, grayscale"
+    elif 'cf' in args.mode:
+        prompt = "color fundus photography, retinal image, medical photography"
+    else:
+        prompt = "medical retinal imaging"
+    
+    # 构建 pipeline（如果 unet 是 PEFT 包装的，使用 base_model）
     multi_controlnet = MultiControlNetModel([cn_s, cn_t])
+    unet_for_pipe = unet.base_model if hasattr(unet, 'base_model') else unet
     pipe = StableDiffusionControlNetPipeline(
         vae=vae,
         text_encoder=text_encoder,
         tokenizer=tokenizer,
-        unet=unet,
+        unet=unet_for_pipe,
         controlnet=multi_controlnet,
         scheduler=noise_scheduler,
         safety_checker=None,
@@ -253,7 +204,6 @@ def visualize_inference(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, toke
             cond_tile, tgt = cond_tile.to(DEVICE), tgt.to(DEVICE)
             
             # 实时提取血管图作为 Scribble 输入
-            # 【v19修正】cond_tile 现在是 [-1, 1] 范围
             source_type, _ = args.mode.split('2')
             cond_tile_01 = (cond_tile + 1) / 2  # [-1, 1] → [0, 1]
             vessel_map = extract_vessel_map(cond_tile_01, source_type, args.mode)
@@ -261,11 +211,10 @@ def visualize_inference(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, toke
             
             # 推理
             generator = torch.Generator(device=DEVICE).manual_seed(42)
-            # 推理尺寸跟随 Dataset (512) 或全局配置
             h, w = cond_tile.shape[2], cond_tile.shape[3]
             
             output_img = pipe(
-                prompt="",
+                prompt=prompt,  # 【v21改进】使用医学图像 prompt
                 image=[cond_scribble, cond_tile],
                 num_inference_steps=25,
                 controlnet_conditioning_scale=[args.scribble_scale, args.tile_scale],
@@ -281,10 +230,8 @@ def visualize_inference(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, toke
                 name = f"sample_{i}"
                 
             # 保存输入和目标
-            # 【v19修正】cond_tile 现在是 [-1, 1]，cond_scribble 是 [0, 1]
             cond_scribble_save = (cond_scribble[0].cpu().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
             cond_tile_save = ((cond_tile[0].cpu().permute(1, 2, 0).numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
-            # tgt is [-1, 1]
             tgt_save = ((tgt[0].cpu().permute(1, 2, 0).numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
             
             Image.fromarray(cond_scribble_save).save(os.path.join(infer_dir, f"{name}_01_scribble.png"))
@@ -307,16 +254,15 @@ def visualize_inference(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, toke
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["cf2fa", "fa2cf", "cf2oct", "oct2cf", "fa2oct", "oct2fa", "cf2octa", "octa2cf"], required=True)
-    parser.add_argument("-n", "--name", default="exp_v15")
+    parser.add_argument("-n", "--name", default="exp_v21")
     parser.add_argument("--max_steps", type=int, default=15000)
     parser.add_argument("--scribble_scale", type=float, default=0.8)
     parser.add_argument("--tile_scale", type=float, default=1.0)
-    # 调低 MS-SSIM / 梯度权重，为纹理留出自由度
-    parser.add_argument("--msssim_lambda", type=float, default=0.05)
-    parser.add_argument("--vessel_lambda", type=float, default=0.05)
-    parser.add_argument("--grad_lambda", type=float, default=0.05)
-    # 新增：高频纹理损失权重
-    parser.add_argument("--texture_lambda", type=float, default=0.2)
+    # 【v21移除】所有像素级损失的 lambda 参数都移除了
+    # 【v21新增】UNet LoRA 相关参数
+    parser.add_argument("--unet_lora_rank", type=int, default=16, help="UNet LoRA rank")
+    parser.add_argument("--unet_lora_alpha", type=int, default=16, help="UNet LoRA alpha")
+    parser.add_argument("--offset_noise_strength", type=float, default=0.1, help="Offset noise strength for better contrast")
     parser.add_argument("--patience", type=int, default=8)
     args = parser.parse_args()
 
@@ -348,6 +294,7 @@ def main():
     val_loader = DataLoader(val_subset, batch_size=1, shuffle=False)
 
     # 2. 模型加载
+    print("\n========== 模型加载 ==========")
     tokenizer = CLIPTokenizer.from_pretrained(BASE_MODEL_DIR, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(BASE_MODEL_DIR, subfolder="text_encoder").to(DEVICE)
     vae = AutoencoderKL.from_pretrained(BASE_MODEL_DIR, subfolder="vae").to(DEVICE)
@@ -355,12 +302,60 @@ def main():
     cn_s = ControlNetModel.from_pretrained(SCRIBBLE_CN_DIR).to(DEVICE)
     cn_t = ControlNetModel.from_pretrained(TILE_CN_DIR).to(DEVICE)
     
-    unet.requires_grad_(False); vae.requires_grad_(False); text_encoder.requires_grad_(False)
+    # 冻结 VAE 和 Text Encoder
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
     
+    # ============ 【v21 核心】UNet LoRA 配置 ============
+    print(f"\n========== UNet LoRA 配置 ==========")
+    # 先冻结 UNet 原始权重
+    unet.requires_grad_(False)
+    
+    # 使用 peft 库创建 LoRA 适配器
+    target_modules = ["to_k", "to_q", "to_v", "to_out.0"]
+    lora_config = LoraConfig(
+        r=args.unet_lora_rank,
+        lora_alpha=args.unet_lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=0.0,
+        bias="none",
+        task_type=TaskType.FEATURE_EXTRACTION,
+    )
+    
+    # 将 LoRA 应用到 UNet
+    unet = get_peft_model(unet, lora_config)
+    
+    # 统计参数
+    unet_lora_params = [p for p in unet.parameters() if p.requires_grad]
+    unet_lora_num = sum(p.numel() for p in unet_lora_params)
+    unet_total_num = sum(p.numel() for p in unet.parameters())
+    
+    print(f"✓ UNet LoRA 已应用")
+    print(f"  - Rank: {args.unet_lora_rank}, Alpha: {args.unet_lora_alpha}")
+    print(f"  - 目标模块: {target_modules}")
+    print(f"  - LoRA 可训练参数: {unet_lora_num:,} ({unet_lora_num/1e6:.2f}M)")
+    print(f"  - UNet 总参数: {unet_total_num:,} ({unet_total_num/1e6:.2f}M)")
+    print(f"  - 参数占比: {unet_lora_num/unet_total_num*100:.2f}%")
+    
+    # ControlNet 参数统计
+    cn_s_num = sum(p.numel() for p in cn_s.parameters() if p.requires_grad)
+    cn_t_num = sum(p.numel() for p in cn_t.parameters() if p.requires_grad)
+    
+    print(f"\n✓ ControlNet (同时训练)")
+    print(f"  - Scribble: {cn_s_num:,} ({cn_s_num/1e6:.2f}M)")
+    print(f"  - Tile: {cn_t_num:,} ({cn_t_num/1e6:.2f}M)")
+    
+    total_trainable = unet_lora_num + cn_s_num + cn_t_num
+    print(f"\n✓ 总可训练参数: {total_trainable:,} ({total_trainable/1e6:.2f}M)")
+    
+    # 优化器配置
     noise_scheduler = DDPMScheduler.from_pretrained(BASE_MODEL_DIR, subfolder="scheduler")
-    optimizer = torch.optim.AdamW(list(cn_s.parameters()) + list(cn_t.parameters()), lr=5e-5, weight_decay=1e-2)
-    # optimizer = bnb.optim.AdamW8bit(list(cn_s.parameters()) + list(cn_t.parameters()), lr=5e-5)
-    msssim_fn = MS_SSIM(data_range=1.0, size_average=True, channel=3).to(DEVICE)
+    all_trainable_params = list(cn_s.parameters()) + list(cn_t.parameters()) + unet_lora_params
+    optimizer = torch.optim.AdamW(all_trainable_params, lr=5e-5, weight_decay=1e-2)
+    
+    print(f"\n✓ 优化器: AdamW (lr=5e-5, weight_decay=1e-2)")
+    print(f"  - Offset Noise 强度: {args.offset_noise_strength}")
+    print(f"  - 早停 Patience: {args.patience}")
 
     # 3. 训练状态变量
     global_step = 0
@@ -368,14 +363,14 @@ def main():
     wait = 0
     start_time = time.time()
 
-    # 日志累加器 (对齐 v14)
+    # 【v21简化】只有一个loss累加器
     loss_accumulator = []
-    msssim_loss_accumulator = []
-    vessel_loss_accumulator = []
-    grad_loss_accumulator = []
-    texture_loss_accumulator = []
 
-    print(f"\n开始训练 [{args.mode}] - 样本数: {len(train_ds)}")
+    print(f"\n========== 开始训练 ==========")
+    print(f"模式: {args.mode}")
+    print(f"训练样本数: {len(train_ds)}")
+    print(f"验证样本数: {len(val_subset)}")
+    print(f"最大步数: {args.max_steps}\n")
     
     while global_step < args.max_steps:
         for batch in train_loader:
@@ -385,60 +380,72 @@ def main():
             cond_tile, tgt = cond_tile.to(DEVICE), tgt.to(DEVICE)
             b = tgt.shape[0]
             
-            # 【核心逻辑】实时生成血管图作为条件输入
-            # 【v19修正】cond_tile 现在是 [-1, 1] 范围，需要转为 [0, 1] 再提取血管
+            # 实时生成血管图作为条件输入
             source_type, _ = args.mode.split('2')
             with torch.no_grad():
                 cond_tile_01 = (cond_tile + 1) / 2  # [-1, 1] → [0, 1]
                 vessel_map = extract_vessel_map(cond_tile_01, source_type, args.mode)
                 cond_scribble = vessel_map.repeat(1, 3, 1, 1)
 
-            # Debug: Step 0 图像保存 (对齐 v14)
+            # Debug: Step 0 图像保存
             if global_step == 0:
                 debug_dir = os.path.join(out_dir, "debug_images_step0")
                 os.makedirs(debug_dir, exist_ok=True)
                 
-                # 尝试获取文件名
                 try:
                     name = os.path.splitext(os.path.basename(cp[0]))[0]
                 except:
                     name = "step0_sample"
 
-                # 1. 保存Scribble条件图 (Vessel)
                 cond_scribble_save = (cond_scribble[0].cpu().float().permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
                 Image.fromarray(cond_scribble_save).save(os.path.join(debug_dir, f"{name}_scribble_input.png"))
                 
-                # 2. 保存Tile条件图 (原图) 【v19修正：现在是 [-1, 1] 范围】
                 cond_tile_save = ((cond_tile[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
                 Image.fromarray(cond_tile_save).save(os.path.join(debug_dir, f"{name}_tile_input.png"))
                 
-                # 3. 保存目标图 (GT) [-1, 1]
                 tgt_save = ((tgt[0].cpu().float().permute(1, 2, 0).numpy() + 1) / 2 * 255).clip(0, 255).astype(np.uint8)
                 Image.fromarray(tgt_save).save(os.path.join(debug_dir, f"{name}_target.png"))
                 
-                print(f"\n✓ Step 0 调试图像已保存到: {debug_dir}\n")
+                print(f"✓ Step 0 调试图像已保存到: {debug_dir}\n")
 
-            # VAE & 噪声处理
+            # VAE 编码
             latents = vae.encode(tgt).latent_dist.sample() * vae.config.scaling_factor
+            
+            # 【v21 核心改进】添加 Offset Noise 提高对比度
+            # Offset Noise: 在标准噪声基础上添加一个全局偏移，有助于生成高对比度图像
             noise = torch.randn_like(latents)
+            if args.offset_noise_strength > 0:
+                noise += args.offset_noise_strength * torch.randn(latents.shape[0], latents.shape[1], 1, 1, device=latents.device)
+            
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (b,), device=DEVICE).long()
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-            prompt_embeds = get_prompt_embeds(b, tokenizer, text_encoder)
+            prompt_embeds = get_prompt_embeds(b, tokenizer, text_encoder, args.mode)
             
             # 双路 ControlNet 前向
-            # 【v19修正】cond_tile 现在是 [-1, 1] 范围，符合 ControlNet 预训练假设
             down_s, mid_s = cn_s(noisy_latents, timesteps, prompt_embeds, cond_scribble, args.scribble_scale, return_dict=False)
             down_t, mid_t = cn_t(noisy_latents, timesteps, prompt_embeds, cond_tile, args.tile_scale, return_dict=False)
             
-            # UNet 预测
-            noise_pred = unet(noisy_latents, timesteps, prompt_embeds, 
-                              down_block_additional_residuals=[s+t for s,t in zip(down_s, down_t)],
-                              mid_block_additional_residual=mid_s+mid_t).sample
+            # UNet 预测（使用 PEFT 包装的模型）
+            if hasattr(unet, 'base_model'):
+                # PEFT 包装的模型，使用 base_model
+                noise_pred = unet.base_model(
+                    sample=noisy_latents,
+                    timestep=timesteps,
+                    encoder_hidden_states=prompt_embeds,
+                    down_block_additional_residuals=[s+t for s,t in zip(down_s, down_t)],
+                    mid_block_additional_residual=mid_s+mid_t,
+                    return_dict=False
+                )[0]
+            else:
+                # 普通模型
+                noise_pred = unet(
+                    noisy_latents, timesteps, prompt_embeds,
+                    down_block_additional_residuals=[s+t for s,t in zip(down_s, down_t)],
+                    mid_block_additional_residual=mid_s+mid_t
+                ).sample
             
-            # 计算 Loss
-            loss, l_mse, l_ssim, l_vessel, l_grad, l_tex = compute_total_loss(
-                noise_pred, noise, noisy_latents, latents, timesteps, vae, noise_scheduler, msssim_fn, args
-            )
+            # 【v21简化】只计算 MSE 损失
+            loss = compute_total_loss(noise_pred, noise)
             
             # 反向传播
             optimizer.zero_grad()
@@ -449,60 +456,20 @@ def main():
             current_lr = get_dynamic_lr(global_step, args.max_steps)
             for param_group in optimizer.param_groups: param_group['lr'] = current_lr
             
-            # 统计 (对齐 v14)
-            loss_accumulator.append(l_mse.item())
-            msssim_loss_accumulator.append(l_ssim.item())
-            vessel_loss_accumulator.append(l_vessel.item())
-            grad_loss_accumulator.append(l_grad.item())
-            texture_loss_accumulator.append(l_tex.item())
+            # 统计
+            loss_accumulator.append(loss.item())
             
-            # 日志打印 (对齐 v14)
+            # 日志打印
             if global_step % 100 == 0:
                 elapsed = time.time() - start_time
-                
-                avg_mse = np.mean(loss_accumulator)
-                avg_ssim = np.mean(msssim_loss_accumulator)
-                avg_vessel = np.mean(vessel_loss_accumulator)
-                avg_grad = np.mean(grad_loss_accumulator)
-                avg_tex = np.mean(texture_loss_accumulator)
-                
-                # 计算加权后的值用于打印
-                w_ssim = avg_ssim * args.msssim_lambda
-                w_vessel = avg_vessel * args.vessel_lambda
-                w_grad = avg_grad * args.grad_lambda
-                w_tex = avg_tex * args.texture_lambda
-                w_total = avg_mse + w_ssim + w_vessel + w_grad + w_tex
-                
+                avg_loss = np.mean(loss_accumulator)
                 loss_accumulator = []
-                msssim_loss_accumulator = []
-                vessel_loss_accumulator = []
-                grad_loss_accumulator = []
-                texture_loss_accumulator = []
                 
                 t_val = timesteps[0].item()
                 
-                msg_parts = [
-                    f"[SD15-v15] step {global_step:5d}/{args.max_steps}",
-                    f"lr:{current_lr:.2e}",
-                    f"total:{w_total:.4f}",
-                    f"mse:{avg_mse:.4f}",
-                ]
-                if args.vessel_lambda > 0:
-                    msg_parts.append(f"vessel:{w_vessel:.4f}(λ={args.vessel_lambda})")
-                if args.msssim_lambda > 0:
-                    msg_parts.append(f"msssim:{w_ssim:.4f}(λ={args.msssim_lambda})")
-                if args.grad_lambda > 0:
-                    msg_parts.append(f"grad:{w_grad:.4f}(λ={args.grad_lambda})")
-                if args.texture_lambda > 0:
-                    msg_parts.append(f"tex:{w_tex:.4f}(λ={args.texture_lambda})")
-                
-                msg_parts.extend([
-                    f"t={t_val:3d}",
-                    f"S:{args.scribble_scale}",
-                    f"T:{args.tile_scale}",
-                    f"{elapsed:.1f}s"
-                ])
-                msg = " | ".join(msg_parts)
+                msg = (f"[v21-LoRA] Step {global_step:5d}/{args.max_steps} | "
+                       f"lr:{current_lr:.2e} | loss:{avg_loss:.4f} | t={t_val:3d} | "
+                       f"S:{args.scribble_scale} T:{args.tile_scale} | {elapsed:.1f}s")
                 print(msg)
                 
                 # 保存日志到文件
@@ -513,15 +480,15 @@ def main():
 
             # 每 500 步验证 & 早停判断
             if global_step % 500 == 0:
-                val_loss = evaluate(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, msssim_fn, tokenizer, text_encoder, args)
+                val_loss = evaluate(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, tokenizer, text_encoder, args)
                 
-                # 记录验证日志 (对齐需求)
-                val_msg = f"[验证] Step {global_step} | Avg Loss: {val_loss:.6f} | Best: {best_val_loss:.6f}"
+                # 记录验证日志
+                val_msg = f"[验证] Step {global_step} | Loss: {val_loss:.6f} | Best: {best_val_loss:.6f}"
                 print(f"\n{val_msg}")
                 with open(os.path.join(out_dir, "validation_log.txt"), "a", encoding="utf-8") as f:
                     f.write(val_msg + "\n")
                 
-                # 【对齐 v14】运行推理可视化
+                # 运行推理可视化
                 visualize_inference(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, tokenizer, text_encoder, args, global_step, out_dir)
 
                 # 保存最新权重
@@ -529,12 +496,18 @@ def main():
                 os.makedirs(latest_dir, exist_ok=True)
                 cn_s.save_pretrained(os.path.join(latest_dir, "controlnet_scribble"))
                 cn_t.save_pretrained(os.path.join(latest_dir, "controlnet_tile"))
+                # 保存 UNet LoRA 权重
+                unet_lora_dir = os.path.join(latest_dir, "unet_lora")
+                os.makedirs(unet_lora_dir, exist_ok=True)
+                unet.save_pretrained(unet_lora_dir)
                 
-                # 保存最新元信息 (对齐 v14)
+                # 保存最新元信息
                 with open(os.path.join(latest_dir, "latest_info.txt"), "w", encoding="utf-8") as f:
                     f.write(f"Latest Step: {global_step}\n")
                     f.write(f"Validation Loss: {val_loss:.6f}\n")
                     f.write(f"Best Loss: {best_val_loss:.6f}\n")
+                    f.write(f"UNet LoRA Rank: {args.unet_lora_rank}\n")
+                    f.write(f"Offset Noise: {args.offset_noise_strength}\n")
                 
                 if val_loss < best_val_loss - 1e-4:
                     best_val_loss = val_loss
@@ -543,11 +516,17 @@ def main():
                     os.makedirs(best_dir, exist_ok=True)
                     cn_s.save_pretrained(os.path.join(best_dir, "controlnet_scribble"))
                     cn_t.save_pretrained(os.path.join(best_dir, "controlnet_tile"))
+                    # 保存最佳 UNet LoRA 权重
+                    unet_lora_dir = os.path.join(best_dir, "unet_lora")
+                    os.makedirs(unet_lora_dir, exist_ok=True)
+                    unet.save_pretrained(unet_lora_dir)
                     
-                    # 保存最佳元信息 (对齐 v14)
+                    # 保存最佳元信息
                     with open(os.path.join(best_dir, "best_info.txt"), "w", encoding="utf-8") as f:
                         f.write(f"Best Step: {global_step}\n")
                         f.write(f"Best Validation Loss: {best_val_loss:.6f}\n")
+                        f.write(f"UNet LoRA Rank: {args.unet_lora_rank}\n")
+                        f.write(f"Offset Noise: {args.offset_noise_strength}\n")
                     
                     best_msg = f"🎉 发现更好的模型 (Step {global_step})，已保存至 best_checkpoint\n"
                     print(best_msg)
@@ -565,4 +544,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
