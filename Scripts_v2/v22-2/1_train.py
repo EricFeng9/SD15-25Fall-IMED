@@ -87,72 +87,144 @@ def get_dynamic_lr(step, max_steps, base_lr=5e-5, min_lr=1e-5):
 
 # ============ 2. 核心损失计算 ============
 
-def compute_total_loss(noise_pred, noise):
+def _gaussian_kernel_1d(kernel_size: int, sigma: float, device, dtype):
+    """生成归一化 1D 高斯卷积核"""
+    half = kernel_size // 2
+    coords = torch.arange(kernel_size, device=device, dtype=dtype) - half
+    gauss = torch.exp(-0.5 * (coords / sigma) ** 2)
+    return gauss / gauss.sum()
+
+
+def gaussian_blur_latent(x, kernel_size=7, sigma=1.5):
     """
-    【v21 核心改进】纯粹的噪声预测损失
-    
-    移除所有像素级约束（SSIM/Vessel/Gradient/Texture），让模型自由学习纹理
-    原因：
-    1. Diffusion 模型的本质是概率生成，应该通过噪声分布学习，而非像素回归
-    2. 像素级 L1/L2 会导致"回归均值"效应，生成过于平滑的结果
-    3. UNet LoRA 会学习到正确的纹理分布，不需要显式约束
+    对 (B, C, H, W) 的 latent tensor 做可分离高斯模糊（保持梯度可通过）。
+    用于将 latent 分解为低频 + 高频两部分。
     """
-    return F.mse_loss(noise_pred, noise)
+    C = x.shape[1]
+    k = _gaussian_kernel_1d(kernel_size, sigma, x.device, x.dtype)
+    pad = kernel_size // 2
+    # 水平方向
+    kw = k.view(1, 1, 1, kernel_size).expand(C, 1, 1, kernel_size)
+    x = F.conv2d(x, kw, padding=(0, pad), groups=C)
+    # 垂直方向
+    kh = k.view(1, 1, kernel_size, 1).expand(C, 1, kernel_size, 1)
+    x = F.conv2d(x, kh, padding=(pad, 0), groups=C)
+    return x
+
+
+def compute_hf_texture_loss(pred_x0, gt_x0, kernel_size=7, sigma=1.5):
+    """
+    在预测 x0（latent 空间）上计算高频纹理 L1 损失。
+
+    步骤：
+    1. 对 pred_x0 和 gt_x0 分别做高斯模糊，得到低频近似
+    2. 用"原图 - 低频"得到高频残差（包含纹理、颗粒、细节）
+    3. 对两者高频残差做 L1，让模型学会在高频维度也对齐 GT
+
+    好处：
+    - 不需要额外 VAE decode，直接在 latent 空间计算，代价极低
+    - 可微分，梯度可以直接反传给 ControlNet 和 UNet LoRA
+    - 明确告诉模型"纹理/颗粒/高频信息不能被平均掉"
+    """
+    pred_blur = gaussian_blur_latent(pred_x0, kernel_size, sigma)
+    gt_blur   = gaussian_blur_latent(gt_x0,   kernel_size, sigma)
+    pred_hf = pred_x0 - pred_blur
+    gt_hf   = gt_x0   - gt_blur
+    return F.l1_loss(pred_hf, gt_hf)
+
+
+def compute_total_loss(noise_pred, noise, noisy_latents, latents,
+                       alphas_cumprod, timesteps, hf_lambda=0.5):
+    """
+    【v22 改进】MSE 噪声损失 + 高频纹理损失（latent x0 空间）
+
+    原理：
+    - loss_mse：标准噪声预测 MSE，约束全频段的全局重建
+    - loss_hf ：从 noise_pred 反推 pred_x0，在 latent 空间对高频残差做 L1
+                这一项专门补偿"有形无骨"——迫使模型在高频细节上也要对齐 GT
+
+    参数：
+    - hf_lambda：高频损失权重，推荐 0.3～1.0，越大高频约束越强
+    """
+    # ---- 标准 MSE ----
+    loss_mse = F.mse_loss(noise_pred, noise)
+
+    # ---- 从 noise_pred 反推预测的干净 x0（latent 空间）----
+    # DDPM 前向：z_t = sqrt(alpha_t)*x0 + sqrt(1-alpha_t)*noise
+    # 因此：x0 = (z_t - sqrt(1-alpha_t)*noise_pred) / sqrt(alpha_t)
+    alpha_t = alphas_cumprod[timesteps].view(-1, 1, 1, 1).to(noisy_latents.device)
+    pred_x0 = (noisy_latents - (1.0 - alpha_t).sqrt() * noise_pred) / (alpha_t.sqrt() + 1e-8)
+    # 在大 t 时 pred_x0 数值不稳定，截断到合理范围
+    pred_x0 = pred_x0.clamp(-10.0, 10.0)
+
+    # ---- 高频纹理损失 ----
+    loss_hf = compute_hf_texture_loss(pred_x0, latents)
+
+    total = loss_mse + hf_lambda * loss_hf
+    return total, loss_mse.item(), loss_hf.item()
 
 # ============ 3. 验证与早停逻辑 ============
 
+VAL_TIMESTEPS = [200, 500, 800]   # 固定时间步：低/中/高噪声各取一个代表点
+
 def evaluate(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, tokenizer, text_encoder, args):
-    """【v21简化】在固定验证集上评估模型：只使用 MSE loss"""
+    """
+    全量验证集 + 固定时间步，消除随机性。
+
+    对每个验证样本，在 VAL_TIMESTEPS=[200,500,800] 三个固定时间步上分别计算 MSE，
+    取平均作为该样本的验证损失。这样验证损失只随模型权重变化，不受随机 t 影响，
+    可以可靠地用于 best checkpoint 选择和早停判断。
+    """
     cn_s.eval(); cn_t.eval()
-    # 如果 unet 是 PEFT 包装的，也要设置为 eval（虽然已经冻结，但保持一致性）
     if hasattr(unet, 'eval'):
         unet.eval()
-    
+
     val_losses = []
     with torch.no_grad():
         for batch in val_loader:
             cond_tile, tgt, _, _ = batch
             cond_tile, tgt = cond_tile.to(DEVICE), tgt.to(DEVICE)
             b = tgt.shape[0]
-            
+
             # 实时提取血管图作为 Scribble 输入
             source_type, _ = args.mode.split('2')
-            cond_tile_01 = (cond_tile + 1) / 2  # [-1, 1] → [0, 1]
+            cond_tile_01 = (cond_tile + 1) / 2
             vessel_map = extract_vessel_map(cond_tile_01, source_type, args.mode)
             cond_scribble = vessel_map.repeat(1, 3, 1, 1)
-            
-            # VAE 编码
+
+            # VAE 编码（只做一次）
             latents = vae.encode(tgt).latent_dist.sample() * vae.config.scaling_factor
-            noise = torch.randn_like(latents)
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (b,), device=DEVICE).long()
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
             prompt_embeds = get_prompt_embeds(b, tokenizer, text_encoder, args.mode)
-            
-            # ControlNet 推理
-            down_s, mid_s = cn_s(noisy_latents, timesteps, prompt_embeds, cond_scribble, args.scribble_scale, return_dict=False)
-            down_t, mid_t = cn_t(noisy_latents, timesteps, prompt_embeds, cond_tile, args.tile_scale, return_dict=False)
-            
-            # UNet 预测（如果是 PEFT 包装的，使用 base_model）
-            if hasattr(unet, 'base_model'):
-                noise_pred = unet.base_model(
-                    sample=noisy_latents,
-                    timestep=timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                    down_block_additional_residuals=[s+t for s,t in zip(down_s, down_t)],
-                    mid_block_additional_residual=mid_s+mid_t,
-                    return_dict=False
-                )[0]
-            else:
-                noise_pred = unet(
-                    noisy_latents, timesteps, prompt_embeds,
-                    down_block_additional_residuals=[s+t for s,t in zip(down_s, down_t)],
-                    mid_block_additional_residual=mid_s+mid_t
-                ).sample
-            
-            # 使用简化的 MSE 损失
-            loss = compute_total_loss(noise_pred, noise)
-            val_losses.append(loss.item())
-            
+
+            sample_losses = []
+            for t_val in VAL_TIMESTEPS:
+                timesteps = torch.full((b,), t_val, device=DEVICE, dtype=torch.long)
+                noise = torch.randn_like(latents)
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+                down_s, mid_s = cn_s(noisy_latents, timesteps, prompt_embeds, cond_scribble, args.scribble_scale, return_dict=False)
+                down_t, mid_t = cn_t(noisy_latents, timesteps, prompt_embeds, cond_tile, args.tile_scale, return_dict=False)
+
+                if hasattr(unet, 'base_model'):
+                    noise_pred = unet.base_model(
+                        sample=noisy_latents,
+                        timestep=timesteps,
+                        encoder_hidden_states=prompt_embeds,
+                        down_block_additional_residuals=[s+t for s,t in zip(down_s, down_t)],
+                        mid_block_additional_residual=mid_s+mid_t,
+                        return_dict=False
+                    )[0]
+                else:
+                    noise_pred = unet(
+                        noisy_latents, timesteps, prompt_embeds,
+                        down_block_additional_residuals=[s+t for s,t in zip(down_s, down_t)],
+                        mid_block_additional_residual=mid_s+mid_t
+                    ).sample
+
+                sample_losses.append(F.mse_loss(noise_pred, noise).item())
+
+            val_losses.append(np.mean(sample_losses))
+
     cn_s.train(); cn_t.train()
     if hasattr(unet, 'train'):
         unet.train()
@@ -263,7 +335,7 @@ def main():
     parser.add_argument("--unet_lora_rank", type=int, default=16, help="UNet LoRA rank")
     parser.add_argument("--unet_lora_alpha", type=int, default=16, help="UNet LoRA alpha")
     parser.add_argument("--offset_noise_strength", type=float, default=0.1, help="Offset noise strength for better contrast")
-    parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--hf_lambda", type=float, default=0.5, help="高频纹理损失权重，推荐 0.3~1.0")
     args = parser.parse_args()
 
     out_dir = os.path.join(OUT_ROOT, args.mode, args.name)
@@ -286,12 +358,8 @@ def main():
     else:
         raise ValueError(f"Unknown mode: {args.mode}")
     
-    # 验证集使用固定子集（10个样本）提高效率
-    val_indices = random.sample(range(len(val_ds)), min(10, len(val_ds)))
-    val_subset = torch.utils.data.Subset(val_ds, val_indices)
-    
     train_loader = DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_subset, batch_size=1, shuffle=False)
+    val_loader   = DataLoader(val_ds,   batch_size=1, shuffle=False, num_workers=2)
 
     # 2. 模型加载
     print("\n========== 模型加载 ==========")
@@ -355,21 +423,19 @@ def main():
     
     print(f"\n✓ 优化器: AdamW (lr=5e-5, weight_decay=1e-2)")
     print(f"  - Offset Noise 强度: {args.offset_noise_strength}")
-    print(f"  - 早停 Patience: {args.patience}")
 
     # 3. 训练状态变量
     global_step = 0
     best_val_loss = float('inf')
-    wait = 0
     start_time = time.time()
 
-    # 【v21简化】只有一个loss累加器
+    # 每个元素为 (total, mse, hf) 三元组
     loss_accumulator = []
 
     print(f"\n========== 开始训练 ==========")
     print(f"模式: {args.mode}")
     print(f"训练样本数: {len(train_ds)}")
-    print(f"验证样本数: {len(val_subset)}")
+    print(f"验证样本数: {len(val_ds)} (全量，固定时间步 {VAL_TIMESTEPS})")
     print(f"最大步数: {args.max_steps}\n")
     
     while global_step < args.max_steps:
@@ -444,9 +510,13 @@ def main():
                     mid_block_additional_residual=mid_s+mid_t
                 ).sample
             
-            # 【v21简化】只计算 MSE 损失
-            loss = compute_total_loss(noise_pred, noise)
-            
+            # 【v22】MSE + 高频纹理损失
+            loss, loss_mse_val, loss_hf_val = compute_total_loss(
+                noise_pred, noise, noisy_latents, latents,
+                noise_scheduler.alphas_cumprod, timesteps,
+                hf_lambda=args.hf_lambda
+            )
+
             # 反向传播
             optimizer.zero_grad()
             loss.backward()
@@ -457,18 +527,20 @@ def main():
             for param_group in optimizer.param_groups: param_group['lr'] = current_lr
             
             # 统计
-            loss_accumulator.append(loss.item())
+            loss_accumulator.append((loss.item(), loss_mse_val, loss_hf_val))
             
             # 日志打印
             if global_step % 100 == 0:
                 elapsed = time.time() - start_time
-                avg_loss = np.mean(loss_accumulator)
+                arr = np.array(loss_accumulator)
+                avg_loss, avg_mse, avg_hf = arr[:, 0].mean(), arr[:, 1].mean(), arr[:, 2].mean()
                 loss_accumulator = []
                 
                 t_val = timesteps[0].item()
                 
-                msg = (f"[v21-LoRA] Step {global_step:5d}/{args.max_steps} | "
-                       f"lr:{current_lr:.2e} | loss:{avg_loss:.4f} | t={t_val:3d} | "
+                msg = (f"[v22-LoRA] Step {global_step:5d}/{args.max_steps} | "
+                       f"lr:{current_lr:.2e} | loss:{avg_loss:.4f} "
+                       f"(mse:{avg_mse:.4f} hf:{avg_hf:.4f}) | t={t_val:3d} | "
                        f"S:{args.scribble_scale} T:{args.tile_scale} | {elapsed:.1f}s")
                 print(msg)
                 
@@ -478,7 +550,7 @@ def main():
                 
                 start_time = time.time()
 
-            # 每 500 步验证 & 早停判断
+            # 每 500 步验证
             if global_step % 500 == 0:
                 val_loss = evaluate(val_loader, vae, unet, cn_s, cn_t, noise_scheduler, tokenizer, text_encoder, args)
                 
@@ -511,7 +583,6 @@ def main():
                 
                 if val_loss < best_val_loss - 1e-4:
                     best_val_loss = val_loss
-                    wait = 0
                     best_dir = os.path.join(out_dir, "best_checkpoint")
                     os.makedirs(best_dir, exist_ok=True)
                     cn_s.save_pretrained(os.path.join(best_dir, "controlnet_scribble"))
@@ -532,13 +603,6 @@ def main():
                     print(best_msg)
                     with open(os.path.join(out_dir, "validation_log.txt"), "a", encoding="utf-8") as f:
                         f.write(best_msg)
-                else:
-                    if global_step >= 4000: # Warm-up 后才触发 patience
-                        wait += 1
-                        print(f"⚠ 验证损耗未下降 ({wait}/{args.patience})\n")
-                        if wait >= args.patience:
-                            print("🛑 触发早停，训练结束。")
-                            return
 
             global_step += 1
 

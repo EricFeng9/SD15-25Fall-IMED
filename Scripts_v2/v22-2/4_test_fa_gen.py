@@ -83,14 +83,15 @@ def generate_controlnet_inputs_v15(img_pil, mode):
 
 # ============ 配置变量（在程序开头指定）============
 # 1. 目标图片路径（待推理的图片目录）
-INPUT_IMAGE_DIR = "/data/student/Fengjunming/SDXL_ControlNet/data/FIVES_extract_v6"
+INPUT_IMAGE_DIR = "/data/student/Fengjunming/SDXL_ControlNet/data/FIVES_extract_v7"
 
 # 2. SD15模型和ControlNet模型路径（多模态）
 BASE_MODEL_DIR = "/data/student/Fengjunming/SDXL_ControlNet/models/sd15-diffusers"
 
 # 各模态转换模型名称 (对应 results/out_ctrl_sd15_dual/[mode]/[name]/best_checkpoint)
 #cf2fa_name = "260128_2" #1.28已修改
-cf2fa_name = "260215_1_lora"
+#cf2fa_name = "260215_1_lora"
+cf2fa_name = "260218_3_Hfrequency"
 fa2cf_name = "260115_3"
 cf2oct_name = "260116_1"
 oct2cf_name = "260116_1"
@@ -102,6 +103,9 @@ octa2cf_name = "260116_5"
 
 # 基路径模板
 CHECKPOINT_BASE = "/data/student/Fengjunming/SDXL_ControlNet/results/out_ctrl_sd15_dual/{mode}/{name}/best_checkpoint"
+
+# CF 生成结果根目录（由 Scripts_v2/v22/2_test_cf_gen.py 生成）
+CF_GEN_PRED_ROOT = "/data/student/Fengjunming/SDXL_ControlNet/results/out_preds_sd15_dual_cf_gen"
 
 # 3. 输出路径（已废弃，直接保存在输入子目录下）
 # OUTPUT_BASE_DIR = "/data/student/Fengjunming/SDXL_ControlNet/results/model_test_output"
@@ -261,23 +265,38 @@ parser.add_argument("--seed", type=int, default=None,
                     help="随机种子（用于复现）")
 parser.add_argument("--use_fp16", action="store_true",
                     help="使用 FP16 推理（降低显存）")
+parser.add_argument(
+    "-n", "--name", type=str, required=True,
+    help="CF 生成脚本 2_test_cf_gen.py 中使用的 --name，对应 out_preds_sd15_dual_cf_gen 下的一级目录"
+)
+parser.add_argument(
+    "--savedir", type=str, required=True,
+    help="CF 生成脚本 2_test_cf_gen.py 中使用的 --savedir，对应 out_preds_sd15_dual_cf_gen/[name] 下的二级目录"
+)
 
 args = parser.parse_args()
 
-# ============ 检查输入目录 ============
-if not os.path.isdir(INPUT_IMAGE_DIR):
-    raise FileNotFoundError(f"输入图片目录不存在: {INPUT_IMAGE_DIR}")
+# ============ 确定 CF 输入目录 ============
+# 目标目录结构：
+#   results/out_preds_sd15_dual_cf_gen/[name]/[savedir]/
+#       1/cf.png
+#       2/cf.png
+#       ...
+CF_INPUT_ROOT = os.path.join(CF_GEN_PRED_ROOT, args.name, str(args.savedir))
 
-# 获取所有子文件夹
+if not os.path.isdir(CF_INPUT_ROOT):
+    raise FileNotFoundError(f"CF 生成图像目录不存在: {CF_INPUT_ROOT}")
+
+# 获取所有子文件夹（通常为 1, 2, 3, ...）
 def natural_sort_key(s):
     return [int(text) if text.isdigit() else text.lower()
             for text in re.split('([0-9]+)', s)]
 
-sub_dirs = sorted([d for d in os.listdir(INPUT_IMAGE_DIR) if os.path.isdir(os.path.join(INPUT_IMAGE_DIR, d))], 
+sub_dirs = sorted([d for d in os.listdir(CF_INPUT_ROOT) if os.path.isdir(os.path.join(CF_INPUT_ROOT, d))], 
                   key=natural_sort_key)
 
 if len(sub_dirs) == 0:
-    raise FileNotFoundError(f"在目录 {INPUT_IMAGE_DIR} 中未找到子文件夹")
+    raise FileNotFoundError(f"在目录 {CF_INPUT_ROOT} 中未找到子文件夹（期望为 1, 2, 3, ...）")
 
 print(f"\n找到 {len(sub_dirs)} 个子文件夹")
 
@@ -452,6 +471,40 @@ def run_inference(img_pil, mode, prompt="", negative_prompt="", steps=30, cfg=7.
     
     return Image.fromarray(pred_np_masked), cond_scribble, cond_tile, Image.fromarray(mask)
 
+
+def make_chessboard(img_a, img_b, num_tiles=8):
+    """
+    生成 img_a 与 img_b 的棋盘格对比图：
+    - 偶数格使用 img_a
+    - 奇数格使用 img_b
+    """
+    img_a = img_a.convert("RGB")
+    img_b = img_b.convert("RGB").resize(img_a.size, Image.BICUBIC)
+    
+    w, h = img_a.size
+    if num_tiles <= 0:
+        num_tiles = 8
+    tile_w = max(1, w // num_tiles)
+    tile_h = max(1, h // num_tiles)
+    
+    arr_a = np.array(img_a)
+    arr_b = np.array(img_b)
+    out = np.zeros_like(arr_a)
+    
+    for i in range(num_tiles):
+        for j in range(num_tiles):
+            y0 = i * tile_h
+            y1 = h if i == num_tiles - 1 else (i + 1) * tile_h
+            x0 = j * tile_w
+            x1 = w if j == num_tiles - 1 else (j + 1) * tile_w
+            
+            if (i + j) % 2 == 0:
+                out[y0:y1, x0:x1] = arr_a[y0:y1, x0:x1]
+            else:
+                out[y0:y1, x0:x1] = arr_b[y0:y1, x0:x1]
+    
+    return Image.fromarray(out)
+
 # ============ 推理循环 ============
 print("\n开始推理...")
 print(f"  - 【v21 特性】支持 UNet LoRA + 医学图像 Prompt")
@@ -462,80 +515,49 @@ if args.prompt:
     print(f"  - 用户自定义 Prompt: \"{args.prompt}\"")
 else:
     print(f"  - 将使用医学图像领域特定的 Prompt (根据模式自动选择)")
+print(f"  - CF 输入根目录: {CF_INPUT_ROOT}")
 print()
 
 processed_count = 0
 
 for sub_dir in sub_dirs:
-    dir_path = os.path.join(INPUT_IMAGE_DIR, sub_dir)
+    dir_path = os.path.join(CF_INPUT_ROOT, sub_dir)
     
-    # 查找原始图片和分割图
-    cf_img_path = os.path.join(dir_path, f"{sub_dir}_cf.png")
-    seg_img_path = os.path.join(dir_path, f"{sub_dir}_seg.png")
+    # 由 2_test_cf_gen.py 生成的 CF 图像，固定命名为 cf.png
+    cf_img_path = os.path.join(dir_path, "cf.png")
     
     if not os.path.exists(cf_img_path):
-        print(f"  [跳过] 文件夹 {sub_dir} 中未找到 cf 图片: {cf_img_path}")
+        print(f"  [跳过] 目录 {dir_path} 中未找到 cf.png")
         continue
 
-    print(f"  [{processed_count+1}/{len(sub_dirs)}] 处理文件夹: {sub_dir}")
+    print(f"  [{processed_count+1}/{len(sub_dirs)}] 处理样本目录: {sub_dir}")
     
     try:
-        # 1. 加载并处理原始 CF 图片
+        # 1. 加载由 CF 生成模型生成的 CF 图片
         real_img_pil = Image.open(cf_img_path).convert("RGB")
-        # 预定义一个 cond_tile 用于裁剪，确保在只跑单模式时逻辑正确
-        cond_tile = None
         
-        # 1.1 生成 FA
-        if args.mode in ["all", "cf2fa"]:
-            print(f"    -> 生成 FA...")
-            fa_gen, _, cond_tile, mask = run_inference(real_img_pil, "cf2fa", args.prompt, args.negative_prompt, args.steps, args.cfg, used_seed)
-            fa_gen.save(os.path.join(dir_path, f"{sub_dir}_fa_gen.png"))
-            mask.save(os.path.join(dir_path, f"{sub_dir}_cf_mask.png"))
-            # 保存输入网络的真实图 (512 尺寸)
-            cond_tile.save(os.path.join(dir_path, f"{sub_dir}_cf_512.png"))
-        
-        # 1.2 生成 OCT
-        if args.mode in ["all", "cf2oct"]:
-            print(f"    -> 生成 OCT...")
-            oct_gen, _, tmp_tile, _ = run_inference(real_img_pil, "cf2oct", args.prompt, args.negative_prompt, args.steps, args.cfg, used_seed)
-            oct_gen.save(os.path.join(dir_path, f"{sub_dir}_oct_gen.png"))
-            if cond_tile is None: cond_tile = tmp_tile
-        
-        # 1.3 处理裁剪并生成 OCTA
-        if args.mode in ["all", "cf2octa"]:
-            print(f"    -> 生成 OCTA (裁剪 CF)...")
-            # 如果前面没跑，手动生成对齐训练逻辑的 cond_tile（保持彩色并缩放）
-            if cond_tile is None:
-                tmp_pil = real_img_pil.convert("RGB")  # 【v21修正】保持彩色
-                cond_tile = tmp_pil.resize((SIZE, SIZE), Image.BICUBIC)
-            
-            # 使用已经resize到512的cond_tile进行裁剪
-            cf_512_np = np.array(cond_tile)
-            cf_clip_np, (r_min, r_max, c_min, c_max) = get_max_inscribed_square(cf_512_np)
-            cf_clip_pil = Image.fromarray(cf_clip_np)
-            # cf_clip_pil.save(os.path.join(dir_path, f"{sub_dir}_cf_clip.png"))
-            
-            # 同时对 seg 图进行相同的 resize 和裁剪
-            if os.path.exists(seg_img_path):
-                seg_img_pil = Image.open(seg_img_path).convert("L")
-                # 先 resize 到 512
-                seg_512_pil = seg_img_pil.resize((SIZE, SIZE), Image.NEAREST)
-                seg_512_np = np.array(seg_512_pil)
-                # 使用相同的坐标裁剪
-                seg_clip_np = seg_512_np[r_min:r_max, c_min:c_max]
-                # 将裁剪后的 seg 也 resize 到 512x512
-                seg_clip_pil = Image.fromarray(seg_clip_np).resize((SIZE, SIZE), Image.NEAREST)
-                seg_clip_pil.save(os.path.join(dir_path, f"{sub_dir}_seg_clip.png"))
-                print(f"    -> 已保存 seg_clip...")
-            else:
-                print(f"    [警告] 未找到分割图: {seg_img_path}")
+        # 2. 使用 cf2fa 模型生成 FA 图
+        print(f"    -> 生成 FA 图 (cf2fa)...")
+        fa_gen, _, _, _ = run_inference(
+            real_img_pil,
+            "cf2fa",
+            args.prompt,
+            args.negative_prompt,
+            args.steps,
+            args.cfg,
+            used_seed,
+        )
+        # 保存到与 cf.png 相同目录，命名为 fa_gen.png
+        fa_out_path = os.path.join(dir_path, "fa_gen.png")
+        fa_gen.save(fa_out_path)
+        print(f"    -> 已保存 FA 图: {fa_out_path}")
 
-            octa_gen, _, cond_tile_clip, clip_mask = run_inference(cf_clip_pil, "cf2octa", args.prompt, args.negative_prompt, args.steps, args.cfg, used_seed)
-            octa_gen.save(os.path.join(dir_path, f"{sub_dir}_octa_gen.png"))
-            clip_mask.save(os.path.join(dir_path, f"{sub_dir}_cf_clip_mask.png"))
-            # 保存裁剪后的真实图 (512 尺寸)
-            cond_tile_clip.save(os.path.join(dir_path, f"{sub_dir}_cf_clip_512.png"))
-            
+        # 3. 生成 CF 与 FA 的棋盘格可视化图
+        chess_img = make_chessboard(real_img_pil, fa_gen, num_tiles=8)
+        chess_out_path = os.path.join(dir_path, "cf_fa_chessboard.png")
+        chess_img.save(chess_out_path)
+        print(f"    -> 已保存 CF-FA 棋盘格图: {chess_out_path}")
+
         processed_count += 1
         
     except Exception as e:
