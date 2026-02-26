@@ -251,8 +251,9 @@ def generate_cf_images(unet, vae, tokenizer, text_encoder, uncond_embeds,
 
         # 2. 逐步去噪
         for t in scheduler.timesteps:
-            # 【v22-4 动态 CFG】前期高 CFG 确定结构，后期低 CFG 保留纹理
-            dynamic_cfg = guidance_scale * (0.4 + 0.6 * (t.float() / t_max))
+            # 【v22-4 动态 CFG】前期高 CFG 确定结构，后期稍低 CFG 保留纹理
+            # 范围: guidance_scale*0.7 ~ guidance_scale*1.0
+            dynamic_cfg = guidance_scale * (0.7 + 0.3 * (t.float() / t_max))
             # [CFG] 同时计算条件和无条件预测
             if hasattr(unet, "base_model"):
                 # 条件预测
@@ -417,7 +418,7 @@ def generate_cf_from_real_cf(
                 t_max = scheduler.config.num_train_timesteps
                 for t in timesteps[start_index:]:
                     # 【v22-4 动态 CFG】
-                    dynamic_cfg = guidance_scale * (0.4 + 0.6 * (t.float() / t_max))
+                    dynamic_cfg = guidance_scale * (0.7 + 0.3 * (t.float() / t_max))
                     # [CFG] 同时计算条件和无条件预测
                     if hasattr(unet, "base_model"):
                         # 条件预测

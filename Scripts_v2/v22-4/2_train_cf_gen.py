@@ -255,8 +255,9 @@ def visualize_random_cf(unet, vae, tokenizer, text_encoder, uncond_embeds,
         t_max = scheduler.config.num_train_timesteps
 
         for t in scheduler.timesteps:
-            # 【v22-4 动态 CFG】前期高 CFG 确定结构，后期低 CFG 保留纹理
-            dynamic_cfg = cfg_scale * (0.4 + 0.6 * (t.float() / t_max))
+            # 【v22-4 动态 CFG】前期高 CFG 确定结构，后期稍低 CFG 保留纹理
+            # 范围: cfg_scale*0.7 ~ cfg_scale*1.0 (如 cfg=3.5 → 2.45~3.5)
+            dynamic_cfg = cfg_scale * (0.7 + 0.3 * (t.float() / t_max))
             
             # [CFG] 同时计算条件和无条件预测
             if hasattr(unet, "base_model"):
