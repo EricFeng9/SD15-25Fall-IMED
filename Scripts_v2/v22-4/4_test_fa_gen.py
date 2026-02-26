@@ -189,6 +189,26 @@ def get_fov_mask(img_np):
     cv2.drawContours(fov_mask, [hull], -1, 255, -1)
     return fov_mask
 
+def add_realistic_fundus_noise(img_pil, noise_level=0.02):
+    """
+    【v22-4 新增】为生成的图片添加模拟真实眼底相机的传感器噪声。
+    用于后处理，恢复真实图片的颗粒感，避免生成图过于平滑。
+    """
+    img_np = np.array(img_pil).astype(np.float32) / 255.0
+
+    # 1. 高斯读出噪声（模拟传感器噪声）
+    gaussian = np.random.normal(0, noise_level, img_np.shape)
+    noisy = img_np + gaussian
+
+    # 2. 轻微色彩通道偏移（模拟色差）
+    # 对于 monochrome 的 FA 也许不需要，但为了对齐 v22-4-CF 模型逻辑，这里保留逻辑
+    for c in range(3):
+        shift = np.random.uniform(-0.003, 0.003)
+        noisy[:, :, c] += shift
+
+    noisy = np.clip(noisy * 255, 0, 255).astype(np.uint8)
+    return Image.fromarray(noisy)
+
 def get_max_inscribed_square(img_np_512):
     """
     从已经resize到512的cf/cf_gen图像的FOV有效区域内提取最大内接正方形。
@@ -281,6 +301,10 @@ parser.add_argument(
 parser.add_argument(
     "--savedir", type=str, required=True,
     help="CF 生成脚本 2_test_cf_gen.py 中使用的 --savedir，对应 out_preds_sd15_dual_cf_gen/[name] 下的二级目录"
+)
+parser.add_argument(
+    "--add_sensor_noise", action="store_true",
+    help="【v22-4 新增】生成后添加传感器噪声，恢复真实眼底图的颗粒感"
 )
 
 args = parser.parse_args()
@@ -526,6 +550,7 @@ print("\n开始推理...")
 print(f"  - 【v21 特性】支持 UNet LoRA + 医学图像 Prompt")
 print(f"  - 运行模式: {args.mode}")
 print(f"  - 子文件夹数量: {len(sub_dirs)}")
+print(f"  - 传感器噪声: {'开启' if args.add_sensor_noise else '关闭'}")
 print(f"  - 参数: scribble_scale={args.scribble_scale}, tile_scale={args.tile_scale}, cfg={args.cfg}, steps={args.steps}, seed={used_seed}")
 if args.prompt:
     print(f"  - 用户自定义 Prompt: \"{args.prompt}\"")
@@ -564,6 +589,12 @@ for sub_dir in sub_dirs:
             used_seed,
             save_debug_dir=dir_path if processed_count == 0 else None  # 只在第一个样本保存调试信息
         )
+
+        # 【v22-4】可选后处理：添加传感器噪声恢复真实质感
+        if args.add_sensor_noise:
+            noise_level = random.uniform(0.01, 0.03)
+            fa_gen = add_realistic_fundus_noise(fa_gen, noise_level)
+
         # 保存到与 cf.png 相同目录，命名为 fa_gen.png
         fa_out_path = os.path.join(dir_path, "fa_gen.png")
         fa_gen.save(fa_out_path)
