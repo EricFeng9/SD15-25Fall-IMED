@@ -66,12 +66,18 @@ def generate_controlnet_inputs_v15(img_pil, mode):
     # 2. 转换为 tensor 并使用 v15 的 vessle_detector 提取血管
     img_tensor = transforms.ToTensor()(cond_tile_pil).unsqueeze(0).to(device)  # (1, 3, 512, 512)
     
+    # 【诊断】检查输入图像的范围
+    print(f"    [诊断] 血管提取输入: min={img_tensor.min():.3f}, max={img_tensor.max():.3f}, mean={img_tensor.mean():.3f}")
+    
     with torch.no_grad():
         vessel_map = extract_vessel_map(
             img_tensor.float(), 
             image_type=source_type,
             mode=mode
         )
+    
+    # 【诊断】检查血管图的统计信息
+    print(f"    [诊断] 血管图输出: min={vessel_map.min():.3f}, max={vessel_map.max():.3f}, mean={vessel_map.mean():.3f}, std={vessel_map.std():.3f}")
     
     # 3. 转换血管图为PIL Image (3通道灰度)
     vessel_np = vessel_map.squeeze().cpu().numpy()
@@ -87,8 +93,9 @@ INPUT_IMAGE_DIR = "/data/student/Fengjunming/SDXL_ControlNet/data/FIVES_extract_
 
 # 2. SD15模型和ControlNet模型路径（多模态）
 BASE_MODEL_DIR = "/data/student/Fengjunming/SDXL_ControlNet/models/sd15-diffusers"
-# 【v22-4】使用 sd-vae-ft-mse VAE（与训练脚本一致）
-VAE_MODEL_PATH = "/data/student/Fengjunming/SDXL_ControlNet/models/sd-vae-ft-mse"
+# 【修复】使用与训练脚本完全一致的 VAE（sd15-diffusers/vae），而非 sd-vae-ft-mse
+# v22-2/1_train.py L368 使用的是 BASE_MODEL_DIR/vae
+VAE_MODEL_PATH = BASE_MODEL_DIR  # 使用 subfolder="vae"
 
 # 各模态转换模型名称 (对应 results/out_ctrl_sd15_dual/[mode]/[name]/best_checkpoint)
 #cf2fa_name = "260128_2" #1.28已修改
@@ -253,14 +260,14 @@ parser.add_argument("--mode", type=str, default="all", choices=["all", "cf2fa", 
                     help="指定推理模式: all(全部), cf2fa(生成FA), cf2oct(生成OCT), cf2octa(裁剪生成OCTA)")
 parser.add_argument("--prompt", default="",
                     help="文本提示词（正向）")
-parser.add_argument("--negative_prompt", default="",
+parser.add_argument("--negative_prompt", default="noisy, grainy, small vessels, capillaries, over-detailed, noise artifacts",
                     help="文本提示词（负向）")
 parser.add_argument("--scribble_scale", type=float, default=0.8,
                     help="Scribble ControlNet 条件强度 (0.0-2.0)")
 parser.add_argument("--tile_scale", type=float, default=1.0,
                     help="Tile ControlNet 条件强度 (0.0-2.0)")
-parser.add_argument("--cfg", type=float, default=7.5,
-                    help="Classifier-Free Guidance 强度")
+parser.add_argument("--cfg", type=float, default=5.0,
+                    help="Classifier-Free Guidance 强度（降低可减少细节幻觉）")
 parser.add_argument("--steps", type=int, default=30,
                     help="去噪步数 (10-100)")
 parser.add_argument("--seed", type=int, default=None,
@@ -312,9 +319,9 @@ os.environ["HF_HUB_OFFLINE"] = "1"
 dtype = torch.float16 if args.use_fp16 else torch.float32
 device = torch.device("cuda")
 
-# 【v22-4】使用 sd-vae-ft-mse VAE（与训练脚本一致）
+# 【修复】使用与 v22-2/1_train.py L368 完全一致的 VAE 加载方式
 vae = AutoencoderKL.from_pretrained(
-    VAE_MODEL_PATH, torch_dtype=dtype, local_files_only=True
+    VAE_MODEL_PATH, subfolder="vae", torch_dtype=dtype, local_files_only=True
 ).to(device)
 vae.eval()
 
@@ -436,7 +443,7 @@ print("✓ 所有模型加载完成")
 
 # ============ 推理辅助函数 ============
 
-def run_inference(img_pil, mode, prompt="", negative_prompt="", steps=30, cfg=7.5, seed=None):
+def run_inference(img_pil, mode, prompt="", negative_prompt="", steps=30, cfg=7.5, seed=None, save_debug_dir=None):
     pipe = get_pipeline(mode)
     generator = torch.Generator(device=device).manual_seed(seed) if seed is not None else None
     
@@ -451,6 +458,12 @@ def run_inference(img_pil, mode, prompt="", negative_prompt="", steps=30, cfg=7.
         img_pil,
         mode=mode
     )
+    
+    # 【诊断】保存血管提取图
+    if save_debug_dir:
+        cond_scribble.save(os.path.join(save_debug_dir, "debug_vessel_scribble.png"))
+        cond_tile.save(os.path.join(save_debug_dir, "debug_tile_input.png"))
+        print(f"    [诊断] 已保存血管提取图到: {save_debug_dir}")
     
     with torch.no_grad():
         output = pipe(
@@ -541,7 +554,7 @@ for sub_dir in sub_dirs:
         
         # 2. 使用 cf2fa 模型生成 FA 图
         print(f"    -> 生成 FA 图 (cf2fa)...")
-        fa_gen, _, _, _ = run_inference(
+        fa_gen, cond_scribble, _, _ = run_inference(
             real_img_pil,
             "cf2fa",
             args.prompt,
@@ -549,11 +562,17 @@ for sub_dir in sub_dirs:
             args.steps,
             args.cfg,
             used_seed,
+            save_debug_dir=dir_path if processed_count == 0 else None  # 只在第一个样本保存调试信息
         )
         # 保存到与 cf.png 相同目录，命名为 fa_gen.png
         fa_out_path = os.path.join(dir_path, "fa_gen.png")
         fa_gen.save(fa_out_path)
         print(f"    -> 已保存 FA 图: {fa_out_path}")
+        
+        # 【诊断】保存血管提取图（只在第一个样本）
+        if processed_count == 0:
+            cond_scribble.save(os.path.join(dir_path, "debug_vessel_map.png"))
+            print(f"    -> [诊断] 已保存血管提取图: {os.path.join(dir_path, 'debug_vessel_map.png')}")
 
         # 3. 生成 CF 与 FA 的棋盘格可视化图
         chess_img = make_chessboard(real_img_pil, fa_gen, num_tiles=8)
