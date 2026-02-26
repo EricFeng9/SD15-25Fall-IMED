@@ -93,7 +93,7 @@ VAE_MODEL_PATH = "/data/student/Fengjunming/SDXL_ControlNet/models/sd-vae-ft-mse
 # 各模态转换模型名称 (对应 results/out_ctrl_sd15_dual/[mode]/[name]/best_checkpoint)
 #cf2fa_name = "260128_2" #1.28已修改
 #cf2fa_name = "260215_1_lora"
-cf2fa_name = "260218_3_Hfrequency"
+cf2fa_name = "260225_1_Hfrequency_Hrank"
 fa2cf_name = "260115_3"
 cf2oct_name = "260116_1"
 oct2cf_name = "260116_1"
