@@ -350,7 +350,10 @@ def main():
 
             if global_step % 500 == 0 and global_step > 0:
                 val_loss = evaluate(val_loader, vae, unet, cn_s, noise_scheduler, tokenizer, text_encoder, args)
-                print(f"[验证] Step {global_step} | Noise_MSE_Loss: {val_loss:.6f} | Best: {best_val_loss:.6f}")
+                val_msg = f"[验证] Step {global_step} | Noise_MSE_Loss: {val_loss:.6f} | Best: {best_val_loss:.6f}"
+                print(val_msg)
+                with open(os.path.join(out_dir, "training_log.txt"), "a", encoding="utf-8") as f: 
+                    f.write(val_msg + "\n")
                 
                 visualize_inference(val_loader, vae, unet, cn_s, noise_scheduler, tokenizer, text_encoder, args, global_step, out_dir)
 
@@ -360,7 +363,22 @@ def main():
                     os.makedirs(best_dir, exist_ok=True)
                     cn_s.save_pretrained(os.path.join(best_dir, "controlnet_scribble"))
                     unet.save_pretrained(os.path.join(best_dir, "unet_lora"))
-                    print(f"🎉 发现更好的模型 (Step {global_step})")
+                    
+                    best_info_msg = f"🎉 发现更好的模型 (Step {global_step}, val_loss: {val_loss:.6f})"
+                    print(best_info_msg)
+                    with open(os.path.join(out_dir, "training_log.txt"), "a", encoding="utf-8") as f: 
+                        f.write(best_info_msg + "\n")
+                    
+                    # 在best_checkpoint目录写入详细信息
+                    with open(os.path.join(best_dir, "best_checkpoint_info.txt"), "w", encoding="utf-8") as f:
+                        f.write(f"Best Checkpoint Information\n")
+                        f.write(f"=" * 50 + "\n")
+                        f.write(f"Step: {global_step}\n")
+                        f.write(f"Validation Loss (Noise_MSE): {val_loss:.6f}\n")
+                        f.write(f"Mode: {args.mode}\n")
+                        f.write(f"Scribble Scale: {args.scribble_scale}\n")
+                        f.write(f"UNet LoRA Rank: {args.unet_lora_rank}\n")
+                        f.write(f"UNet LoRA Alpha: {args.unet_lora_alpha}\n")
 
             global_step += 1
 
