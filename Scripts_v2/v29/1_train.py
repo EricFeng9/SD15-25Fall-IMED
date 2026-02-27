@@ -156,8 +156,16 @@ def evaluate(val_loader, vae, unet, cn_s, noise_scheduler, tokenizer, text_encod
     if hasattr(unet, 'eval'): unet.eval()
     val_losses = []
     
+    # 固定 seed 随机抽取最多 20 个样本，加速验证过程
+    torch.manual_seed(42)
+    total_val = len(val_loader)
+    num_eval = min(20, total_val)
+    eval_indices = set(torch.randperm(total_val)[:num_eval].tolist())
+    
     with torch.no_grad():
-        for batch in val_loader:
+        for i, batch in enumerate(val_loader):
+            if i not in eval_indices:
+                continue
             cond, tgt, _, _ = batch
             cond, tgt = cond.to(DEVICE), tgt.to(DEVICE)
             b = tgt.shape[0]
@@ -219,7 +227,7 @@ def visualize_inference(val_loader, vae, unet, cn_s, noise_scheduler, tokenizer,
             
             generator = torch.Generator(device=DEVICE).manual_seed(42)
             output_img = pipe(
-                prompt=prompt, image=cond, num_inference_steps=25,
+                prompt=prompt, image=cond, num_inference_steps=50,
                 controlnet_conditioning_scale=args.scribble_scale, generator=generator,
                 width=w, height=h
             ).images[0]
