@@ -121,27 +121,7 @@ class CFFASegDataset(Dataset):
             fa_points = read_points_from_txt(sample['fa_pts'])
             registered_fa_np = register_image(cf_np, cf_points, fa_np, fa_points)
             
-            m1 = np.any(cf_np > 10, axis=2)
-            m2 = np.any(registered_fa_np > 10, axis=2)
-            valid_mask = m1 & m2
-            
-            rows = np.any(valid_mask, axis=1)
-            cols = np.any(valid_mask, axis=0)
-            if np.any(rows) and np.any(cols):
-                rmin, rmax = np.where(rows)[0][[0, -1]]
-                cmin, cmax = np.where(cols)[0][[0, -1]]
-                f_cf = cf_np[rmin:rmax+1, cmin:cmax+1].copy()
-                f_fa = registered_fa_np[rmin:rmax+1, cmin:cmax+1].copy()
-                f_mask = mask_np[rmin:rmax+1, cmin:cmax+1].copy()
-                
-                vm_crop = valid_mask[rmin:rmax+1, cmin:cmax+1]
-                f_cf[~vm_crop] = 0
-                f_fa[~vm_crop] = 0
-                f_mask[~vm_crop] = 0
-                
-                cf_pil = Image.fromarray(f_cf)
-                fa_pil = Image.fromarray(f_fa)
-                mask_pil = Image.fromarray(f_mask)
+            fa_pil = Image.fromarray(registered_fa_np)
         except Exception as e:
             pass
 
