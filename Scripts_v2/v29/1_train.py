@@ -297,14 +297,22 @@ def main():
     all_trainable_params = list(cn_s.parameters()) + [p for p in unet.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(all_trainable_params, lr=5e-5, weight_decay=1e-2)
 
-    global_step = 0
-    best_val_loss = float('inf')
+    print("\n========== 训练前初始验证 (Step 0) ==========")
+    initial_val_loss = evaluate(val_loader, vae, unet, cn_s, noise_scheduler, tokenizer, text_encoder, args)
+    print(f"[验证] Step 0 (训练前) | Img_MSE_Loss: {initial_val_loss:.6f}")
+    
+    visualize_inference(val_loader, vae, unet, cn_s, noise_scheduler, tokenizer, text_encoder, args, 0, out_dir)
+    
+    best_val_loss = initial_val_loss
+    print(f"初始 best_val_loss 设置为: {best_val_loss:.6f}\n")
+
+    global_step = 1
     loss_accumulator = []
     
     start_time = time.time()
-    while global_step < args.max_steps:
+    while global_step <= args.max_steps:
         for batch in train_loader:
-            if global_step >= args.max_steps: break
+            if global_step > args.max_steps: break
             
             cond, tgt, mask_path, tgt_path = batch
             cond, tgt = cond.to(DEVICE), tgt.to(DEVICE)
@@ -352,7 +360,7 @@ def main():
                 with open(os.path.join(out_dir, "training_log.txt"), "a", encoding="utf-8") as f: f.write(msg + "\n")
                 start_time = time.time()
 
-            if global_step % 500 == 0:
+            if global_step % 500 == 0 and global_step > 0:
                 val_loss = evaluate(val_loader, vae, unet, cn_s, noise_scheduler, tokenizer, text_encoder, args)
                 print(f"[验证] Step {global_step} | Img_MSE_Loss: {val_loss:.6f} | Best: {best_val_loss:.6f}")
                 
