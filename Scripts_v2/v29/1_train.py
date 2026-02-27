@@ -151,7 +151,7 @@ class CFFASegDataset(Dataset):
 VAL_TIMESTEPS = [200, 500, 800]
 
 def evaluate(val_loader, vae, unet, cn_s, noise_scheduler, tokenizer, text_encoder, args):
-    """验证时计算预测图像和真实图像的MSE"""
+    """验证时计算Latent空间的噪声预测MSE"""
     cn_s.eval()
     if hasattr(unet, 'eval'): unet.eval()
     val_losses = []
@@ -188,13 +188,9 @@ def evaluate(val_loader, vae, unet, cn_s, noise_scheduler, tokenizer, text_encod
                     return_dict=False
                 )[0]
 
-                # 获取预测的 x0 并解码
-                alpha_t = noise_scheduler.alphas_cumprod[timesteps].view(-1, 1, 1, 1).to(DEVICE)
-                pred_x0 = (noisy_latents - (1.0 - alpha_t).sqrt() * noise_pred) / (alpha_t.sqrt() + 1e-8)
-                pred_x0 = pred_x0.clamp(-2.0, 2.0)
-                pred_img = vae.decode(pred_x0 / vae.config.scaling_factor).sample
-
-                sample_losses.append(F.mse_loss(pred_img, tgt).item())
+                # 在Latent空间计算预测噪声与真实噪声的MSE
+                loss = F.mse_loss(noise_pred, noise, reduction="mean")
+                sample_losses.append(loss.item())
 
             val_losses.append(np.mean(sample_losses))
 
@@ -296,7 +292,7 @@ def main():
 
     print("\n========== 训练前初始验证 (Step 0) ==========")
     initial_val_loss = evaluate(val_loader, vae, unet, cn_s, noise_scheduler, tokenizer, text_encoder, args)
-    print(f"[验证] Step 0 (训练前) | Img_MSE_Loss: {initial_val_loss:.6f}")
+    print(f"[验证] Step 0 (训练前) | Noise_MSE_Loss: {initial_val_loss:.6f}")
     
     visualize_inference(val_loader, vae, unet, cn_s, noise_scheduler, tokenizer, text_encoder, args, 0, out_dir)
     
@@ -331,13 +327,8 @@ def main():
                 return_dict=False
             )[0]
             
-            # 使用图像级别的 MSE Loss：在训练阶段解码 pred_x0 计算与 tgt_img 的 MSE
-            alpha_t = noise_scheduler.alphas_cumprod[timesteps].view(-1, 1, 1, 1).to(DEVICE)
-            pred_x0 = (noisy_latents - (1.0 - alpha_t).sqrt() * noise_pred) / (alpha_t.sqrt() + 1e-8)
-            pred_x0 = pred_x0.clamp(-2.0, 2.0)
-            pred_img = vae.decode(pred_x0 / vae.config.scaling_factor).sample
-
-            loss = F.mse_loss(pred_img, tgt)
+            # 在Latent空间计算预测噪声与真实噪声的MSE
+            loss = F.mse_loss(noise_pred, noise, reduction="mean")
 
             optimizer.zero_grad()
             loss.backward()
@@ -352,14 +343,14 @@ def main():
                 elapsed = time.time() - start_time
                 avg_loss = np.mean(loss_accumulator) if len(loss_accumulator) > 0 else 0
                 loss_accumulator = []
-                msg = f"[Vessel2Img] Step {global_step:5d}/{args.max_steps} | lr:{current_lr:.2e} | img_mse_loss:{avg_loss:.4f}  | {elapsed:.1f}s"
+                msg = f"[Vessel2Img] Step {global_step:5d}/{args.max_steps} | lr:{current_lr:.2e} | noise_mse_loss:{avg_loss:.4f}  | {elapsed:.1f}s"
                 print(msg)
                 with open(os.path.join(out_dir, "training_log.txt"), "a", encoding="utf-8") as f: f.write(msg + "\n")
                 start_time = time.time()
 
             if global_step % 500 == 0 and global_step > 0:
                 val_loss = evaluate(val_loader, vae, unet, cn_s, noise_scheduler, tokenizer, text_encoder, args)
-                print(f"[验证] Step {global_step} | Img_MSE_Loss: {val_loss:.6f} | Best: {best_val_loss:.6f}")
+                print(f"[验证] Step {global_step} | Noise_MSE_Loss: {val_loss:.6f} | Best: {best_val_loss:.6f}")
                 
                 visualize_inference(val_loader, vae, unet, cn_s, noise_scheduler, tokenizer, text_encoder, args, global_step, out_dir)
 
