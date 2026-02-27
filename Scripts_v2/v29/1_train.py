@@ -105,8 +105,17 @@ class CFFASegDataset(Dataset):
         cf_pil = Image.open(cf_path).convert("RGB")
         fa_pil = Image.open(fa_path).convert("RGB")
         
+        # 从完整路径中提取包含augN的信息
+        # 例如：/path/to/001_01_aug1/001_01.png -> 001_01_aug1
+        parent_dir = os.path.basename(os.path.dirname(cf_path))
         basename = os.path.basename(cf_path).replace('.png', '')
-        mask_path = os.path.join(self.mask_dir, f"{basename}_seg.png")
+        # 如果父目录包含augN，则使用父目录名作为mask文件的前缀
+        if 'aug' in parent_dir:
+            mask_filename = f"{parent_dir}_seg.png"
+        else:
+            mask_filename = f"{basename}_seg.png"
+        
+        mask_path = os.path.join(self.mask_dir, mask_filename)
         if os.path.exists(mask_path):
             mask_pil = Image.open(mask_path).convert("RGB")
         else:
