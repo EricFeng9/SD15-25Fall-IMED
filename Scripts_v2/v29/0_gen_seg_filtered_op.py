@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-血管分割图生成脚本 - FIVES数据集版本
+血管分割图生成脚本
 -------------------
 功能：
-- 读取 FIVES 数据集中的所有 CF 图像
+- 读取 CFFA 数据集中的所有 CF 图像
 - 调用 FSG-Net-pytorch 模型进行血管分割
-- 将分割图保存在当前脚本所在目录下的 vessel_masks_FIVES 文件夹中
-- 文件名保存为 [原图编号]_seg.png （例如 1_A_seg.png）
+- 将分割图保存在当前脚本所在目录下的 vessel_masks 文件夹中
+- 文件名保存为 [原图编号]_seg.png （例如 001_01_seg.png）
 """
 
 import os
@@ -22,8 +22,8 @@ import sys
 # ============ 路径配置 ============
 # 项目根目录
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-DATA_ROOT = os.path.join(PROJECT_ROOT, "data/FIVES_extract_origin")
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vessel_masks_FIVES")
+DATA_ROOT = os.path.join(PROJECT_ROOT, "data/operation_pre_filtered_cffa")
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vessel_masks_filtered_op")
 FSG_NET_DIR = os.path.join(PROJECT_ROOT, "FSG-Net-pytorch")
 MODEL_PATH = os.path.join(FSG_NET_DIR, "FSG-Net-HRF.pt")
 
@@ -65,7 +65,7 @@ def process_and_save():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # 1. 收集所有 CF 图像
-    print("📂 扫描FIVES数据集...")
+    print("📂 扫描数据集...")
     all_cf_paths = []
     
     # 检查数据目录是否存在
@@ -73,13 +73,11 @@ def process_and_save():
         print(f"❌ 数据目录不存在: {DATA_ROOT}")
         return
         
-    # 遍历所有子目录，找到所有的*_cf.png文件
     for subdir in sorted(os.listdir(DATA_ROOT)):
         subdir_path = os.path.join(DATA_ROOT, subdir)
         if not os.path.isdir(subdir_path):
             continue
-        # 在每个子目录中查找*_cf.png文件
-        cf_files = glob.glob(os.path.join(subdir_path, "*_cf.png"))
+        cf_files = glob.glob(os.path.join(subdir_path, "*_01.png"))
         all_cf_paths.extend(cf_files)
         
     print(f"找到 {len(all_cf_paths)} 张 CF 图像。")
@@ -94,12 +92,12 @@ def process_and_save():
     with torch.no_grad():
         for cf_path in tqdm(all_cf_paths, desc="提取血管图"):
             # 获取完整路径信息来构建唯一文件名
-            # 例如: .../1_A/1_A_cf.png -> 1_A_seg_fsgnet.png
+            # 例如: .../035_02_aug2/035_01.png -> 035_02_aug2_seg.png
             parent_dir = os.path.basename(os.path.dirname(cf_path))  # 获取父目录名
             basename = os.path.basename(cf_path).replace('.png', '')  # 去掉.png
             
             # 使用父目录名作为输出文件名，确保唯一性
-            out_name = f"{parent_dir}_seg_fsgnet.png"
+            out_name = f"{parent_dir}_seg.png"
             out_path = os.path.join(OUTPUT_DIR, out_name)
             
             # 如果已经存在可以跳过
