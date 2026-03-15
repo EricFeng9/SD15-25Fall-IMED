@@ -3,6 +3,7 @@ import glob
 import numpy as np
 import torch
 import cv2
+import random
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -119,20 +120,13 @@ class CFFADataset(Dataset):
         if not os.path.exists(root_dir):
             raise FileNotFoundError(f"Root directory not found: {root_dir}")
 
-        # 遍历所有子目录
+        # 1. 搜集所有样本
+        all_samples = []
         subdirs = sorted(os.listdir(root_dir))
         for subdir in subdirs:
             subdir_path = os.path.join(root_dir, subdir)
             if not os.path.isdir(subdir_path):
                 continue
-            
-            # 简单的 split 逻辑: aug5 作为测试集/验证集，其他作为训练集
-            if split == 'train':
-                if 'aug5' in subdir:
-                    continue
-            else: # val or test
-                if 'aug5' not in subdir:
-                    continue
             
             # 寻找配对图像 (01 为 CF, 02 为 FA)
             png_files = glob.glob(os.path.join(subdir_path, "*_01.png"))
@@ -143,14 +137,46 @@ class CFFADataset(Dataset):
                 fa_pts = os.path.join(subdir_path, f"{base_name}_02.txt")
                 
                 if os.path.exists(fa_path) and os.path.exists(cf_pts) and os.path.exists(fa_pts):
-                    self.samples.append({
+                    all_samples.append({
                         'cf_path': cf_path,
                         'fa_path': fa_path,
                         'cf_pts': cf_pts,
                         'fa_pts': fa_pts
                     })
         
-        print(f"[CFFADataset] Found {len(self.samples)} pairs in {split} set.")
+        # 2. 按眼球编号分组，然后按组划分训练集和测试集
+        # 提取眼球编号（子目录名中下划线前的部分，如 063_02 -> 063）
+        # 与 operation_pre_filtered_cffa_dataset.py 保持一致
+        fundus_groups = {}
+        for sample in all_samples:
+            # 从路径中提取眼球编号
+            subdir_name = os.path.basename(os.path.dirname(sample['cf_path']))
+            fundus_id = subdir_name.split('_')[0]  # 例如 "063_02" -> "063"
+            
+            if fundus_id not in fundus_groups:
+                fundus_groups[fundus_id] = []
+            fundus_groups[fundus_id].append(sample)
+        
+        # 按眼球ID排序并随机划分（固定种子42以保证可复现，与原始数据集一致）
+        fundus_ids = sorted(fundus_groups.keys())
+        random.Random(42).shuffle(fundus_ids)
+        
+        num_total_fundus = len(fundus_ids)
+        num_train_fundus = int(num_total_fundus * 0.8)
+        
+        train_fundus_ids = set(fundus_ids[:num_train_fundus])
+        test_fundus_ids = set(fundus_ids[num_train_fundus:])
+        
+        # 根据眼球ID分配样本
+        if split == 'train':
+            for fundus_id in train_fundus_ids:
+                self.samples.extend(fundus_groups[fundus_id])
+        else:  # val or test
+            for fundus_id in test_fundus_ids:
+                self.samples.extend(fundus_groups[fundus_id])
+        
+        num_total = len(all_samples)
+        print(f"[CFFADataset] {split} set: {len(self.samples)} samples from {len(fundus_ids) - num_train_fundus if split != 'train' else num_train_fundus} fundus images (total {num_total} samples, {num_total_fundus} fundus images)")
 
     def __len__(self):
         return len(self.samples)

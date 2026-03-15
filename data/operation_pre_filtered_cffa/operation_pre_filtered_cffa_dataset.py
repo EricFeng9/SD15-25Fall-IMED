@@ -3,6 +3,7 @@ import glob
 import numpy as np
 import torch
 import cv2
+import random
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -42,7 +43,7 @@ def filter_valid_area(img1, img2):
     cols = np.any(valid_mask, axis=0)
     
     if not np.any(rows) or not np.any(cols):
-        return img1, img2
+        return img1, img2, (0, 0)
     
     row_min, row_max = np.where(rows)[0][[0, -1]]
     col_min, col_max = np.where(cols)[0][[0, -1]]
@@ -62,23 +63,25 @@ def filter_valid_area(img1, img2):
     else:
         filtered_img2[~valid_mask_cropped] = 0
     
-    return filtered_img1, filtered_img2
+    return filtered_img1, filtered_img2, (col_min, row_min)
 
 def register_image(cond_img, cond_points, tgt_img, tgt_points):
     """将tgt图配准到cond图的空间"""
     assert len(cond_points) == len(tgt_points), "cond和tgt的点位数量必须一致"
     
     cond_height, cond_width = cond_img.shape[:2]
+    H = np.eye(3, dtype=np.float32)
     
     if len(cond_points) >= 4:
-        H, mask = cv2.findHomography(tgt_points, cond_points, cv2.RANSAC, 5.0)
+        H_est, mask = cv2.findHomography(tgt_points, cond_points, cv2.RANSAC, 5.0)
         
-        if H is None:
-            H = cv2.estimateAffinePartial2D(tgt_points, cond_points)[0]
-            if H is not None:
-                H = np.vstack([H, [0, 0, 1]])
+        if H_est is None:
+            H_est = cv2.estimateAffinePartial2D(tgt_points, cond_points)[0]
+            if H_est is not None:
+                H_est = np.vstack([H_est, [0, 0, 1]])
         
-        if H is not None:
+        if H_est is not None:
+            H = H_est.astype(np.float32)
             registered_img = cv2.warpPerspective(
                 tgt_img, 
                 H, 
@@ -98,9 +101,9 @@ def register_image(cond_img, cond_points, tgt_img, tgt_points):
         else:
             registered_img = np.zeros((cond_height, cond_width), dtype=tgt_img.dtype)
     
-    return registered_img
+    return registered_img, H
 
-# ============ CF-FA 数据集加载器 ============
+# ============ CF_FA 数据集加载器 ============
 SIZE = 512
 
 class CFFADataset(Dataset):
@@ -109,7 +112,7 @@ class CFFADataset(Dataset):
     支持配准和有效区域筛选
     返回: cond_original, tgt, cond_path, tgt_path
     """
-    def __init__(self, root_dir='/data/student/Fengjunming/SDXL_ControlNet/data/operation_pre_filtered_cffa', split='train', mode='cf2fa'):
+    def __init__(self, root_dir='/data/student/Fengjunming/LoFTR/data/operation_pre_filtered_cffa', split='train', mode='fa2cf'):
         self.root_dir = root_dir
         self.split = split
         self.mode = mode
@@ -119,20 +122,13 @@ class CFFADataset(Dataset):
         if not os.path.exists(root_dir):
             raise FileNotFoundError(f"Root directory not found: {root_dir}")
 
-        # 遍历所有子目录
+        # 1. 搜集所有样本
+        all_samples = []
         subdirs = sorted(os.listdir(root_dir))
         for subdir in subdirs:
             subdir_path = os.path.join(root_dir, subdir)
             if not os.path.isdir(subdir_path):
                 continue
-            
-            # 简单的 split 逻辑: aug5 作为测试集/验证集，其他作为训练集
-            if split == 'train':
-                if 'aug5' in subdir:
-                    continue
-            else: # val or test
-                if 'aug5' not in subdir:
-                    continue
             
             # 寻找配对图像 (01 为 CF, 02 为 FA)
             png_files = glob.glob(os.path.join(subdir_path, "*_01.png"))
@@ -143,74 +139,142 @@ class CFFADataset(Dataset):
                 fa_pts = os.path.join(subdir_path, f"{base_name}_02.txt")
                 
                 if os.path.exists(fa_path) and os.path.exists(cf_pts) and os.path.exists(fa_pts):
-                    self.samples.append({
-                        'cf_path': cf_path,
+                    all_samples.append({
                         'fa_path': fa_path,
-                        'cf_pts': cf_pts,
-                        'fa_pts': fa_pts
+                        'cf_path': cf_path,
+                        'fa_pts': fa_pts,
+                        'cf_pts': cf_pts
                     })
         
-        print(f"[CFFADataset] Found {len(self.samples)} pairs in {split} set.")
+        # 2. 按眼底编号分组，然后按组划分训练集和测试集
+        # 提取眼底编号（文件名中下划线前的部分，如 063_02 -> 063）
+        fundus_groups = {}
+        for sample in all_samples:
+            # 从路径中提取眼底编号
+            subdir_name = os.path.basename(os.path.dirname(sample['fa_path']))
+            fundus_id = subdir_name.split('_')[0]  # 例如 "063_02" -> "063"
+            
+            if fundus_id not in fundus_groups:
+                fundus_groups[fundus_id] = []
+            fundus_groups[fundus_id].append(sample)
+        
+        # 按眼底ID排序并随机划分（固定种子以保证可复现）
+        fundus_ids = sorted(fundus_groups.keys())
+        random.Random(42).shuffle(fundus_ids)
+        
+        num_total_fundus = len(fundus_ids)
+        num_train_fundus = int(num_total_fundus * 0.8)
+        
+        train_fundus_ids = set(fundus_ids[:num_train_fundus])
+        test_fundus_ids = set(fundus_ids[num_train_fundus:])
+        
+        # 根据眼底ID分配样本
+        if split == 'train':
+            for fundus_id in train_fundus_ids:
+                self.samples.extend(fundus_groups[fundus_id])
+        else:  # val or test
+            for fundus_id in test_fundus_ids:
+                self.samples.extend(fundus_groups[fundus_id])
+        
+        num_total = len(all_samples)
+        print(f"[CFFADataset] {split} set: {len(self.samples)} samples from {len(fundus_ids) - num_train_fundus if split != 'train' else num_train_fundus} fundus images (total {num_total} samples, {num_total_fundus} fundus images)")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        cf_path = sample['cf_path']
         fa_path = sample['fa_path']
-        cf_pts_path = sample['cf_pts']
+        cf_path = sample['cf_path']
         fa_pts_path = sample['fa_pts']
+        cf_pts_path = sample['cf_pts']
         
-        # 1. 加载图像
-        cf_pil = Image.open(cf_path).convert("RGB")
+        # 1. 加载原始图像
         fa_pil = Image.open(fa_path).convert("RGB")
+        cf_pil = Image.open(cf_path).convert("RGB")
         
-        # 2. 配准（不再进行有效区域筛选裁剪）
+        fa_np = np.array(fa_pil)
+        cf_np = np.array(cf_pil)
+        
+        # 2. 读取关键点
         try:
-            cf_points = read_points_from_txt(cf_pts_path)
             fa_points = read_points_from_txt(fa_pts_path)
-            
-            cf_np = np.array(cf_pil)
-            fa_np = np.array(fa_pil)
-            
-            # 将 FA 配准到 CF 空间
-            registered_fa_np = register_image(cf_np, cf_points, fa_np, fa_points)
-            
-            # 直接使用配准后的整幅图像，不做 filter_valid_area 裁剪
-            cf_pil = Image.fromarray(cf_np)
-            fa_pil = Image.fromarray(registered_fa_np)
-        except Exception as e:
-            # 若配准失败，则退回原始图像
-            pass
-            
-        # 3. Resize 到 512x512
-        cf_pil = cf_pil.resize((SIZE, SIZE), Image.BICUBIC)
-        fa_pil = fa_pil.resize((SIZE, SIZE), Image.BICUBIC)
+            cf_points = read_points_from_txt(cf_pts_path)
+        except:
+            fa_points = np.array([])
+            cf_points = np.array([])
         
-        # 【v19修改】保持 CF 图的原始 RGB，不做灰度转换
-        # 旧版本：cf_pil = cf_pil.convert("L").convert("RGB")
-        # 新版本：直接使用彩色 CF 图，与 FA 图保持一致的处理方式
+        # 3. 确定 fix 和 moving: cffa -> fix=CF, moving=FA
+        fix_np = cf_np
+        moving_np = fa_np
+        fix_points = cf_points
+        moving_points = fa_points
+        fix_path = cf_path
+        moving_path = fa_path
         
-        # 4. 根据 mode 确定条件图和目标图
-        if self.mode == 'cf2fa':
-            cond_pil = cf_pil
-            tgt_pil = fa_pil
-            cond_path = cf_path
-            tgt_path = fa_path
-        else:  # fa2cf
-            cond_pil = fa_pil
-            tgt_pil = cf_pil
-            cond_path = fa_path
-            tgt_path = cf_path
-            
-        # 5. 转换为 Tensor
-        cond_original = transforms.ToTensor()(cond_pil)  # [0, 1]
-        tgt = transforms.ToTensor()(tgt_pil)             # [0, 1]
+        # 4. 计算配准后的moving_gt
+        T_0to1 = np.eye(3, dtype=np.float32)
+        if len(fix_points) >= 4 and len(moving_points) >= 4:
+            moving_gt_np, T_0to1 = register_image(fix_np, fix_points, moving_np, moving_points)
+        else:
+            moving_gt_np = moving_np.copy()
         
-        # 6. 归一化到 [-1, 1]
-        # 【v19修正】ControlNet 预训练时使用的是 [-1, 1] 范围，因此条件图和目标图都需要归一化
-        cond_original = cond_original * 2 - 1  # [0, 1] → [-1, 1]
-        tgt = tgt * 2 - 1                      # [0, 1] → [-1, 1]
+        # 5. 移除裁剪逻辑，直接使用原图进行 Resize
+        fix_filtered = fix_np
+        moving_gt_filtered = moving_gt_np
         
-        return cond_original, tgt, cond_path, tgt_path
+        # 6. 准备原始moving
+        moving_original_pil = Image.fromarray(moving_np).resize((SIZE, SIZE), Image.BICUBIC)
+        
+        # 7. Resize 到 512x512 并补偿 T_0to1 尺度
+        h_orig, w_orig = fix_np.shape[:2]
+        h_mov_orig, w_mov_orig = moving_np.shape[:2]
+        
+        # 尺度补偿：T_scaled = T_fix_scale @ T_orig @ inv(T_mov_scale)
+        # 这样矩阵才能在 512x512 空间内自恰
+        T_fix_scale = np.array([
+            [SIZE / float(w_orig), 0, 0],
+            [0, SIZE / float(h_orig), 0],
+            [0, 0, 1]
+        ], dtype=np.float32)
+        
+        T_mov_scale_inv = np.array([
+            [float(w_mov_orig) / SIZE, 0, 0],
+            [0, float(h_mov_orig) / SIZE, 0],
+            [0, 0, 1]
+        ], dtype=np.float32)
+        
+        T_0to1 = T_fix_scale @ T_0to1 @ T_mov_scale_inv
+
+        fix_pil = Image.fromarray(fix_filtered).resize((SIZE, SIZE), Image.BICUBIC)
+        moving_gt_pil = Image.fromarray(moving_gt_filtered).resize((SIZE, SIZE), Image.BICUBIC)
+        
+        # 8. 转换为 Tensor
+        fix_tensor = transforms.ToTensor()(fix_pil)  # [0, 1]
+        moving_original_tensor = transforms.ToTensor()(moving_original_pil)  # [0, 1]
+        moving_gt_tensor = transforms.ToTensor()(moving_gt_pil)  # [0, 1]
+        
+        # 9. 归一化到 [-1, 1]
+        moving_original_tensor = moving_original_tensor * 2 - 1
+        moving_gt_tensor = moving_gt_tensor * 2 - 1
+        
+        return fix_tensor, moving_original_tensor, moving_gt_tensor, fix_path, moving_path, torch.from_numpy(T_0to1)
+
+    def get_raw_sample(self, idx):
+        """返回未配准、未裁剪的原始数据及其关键点"""
+        sample = self.samples[idx]
+        fa_path, cf_path = sample['fa_path'], sample['cf_path']
+        fa_pts_path, cf_pts_path = sample['fa_pts'], sample['cf_pts']
+
+        # 读取原图
+        img_fa = cv2.imread(fa_path, cv2.IMREAD_GRAYSCALE)
+        img_cf = cv2.imread(cf_path, cv2.IMREAD_GRAYSCALE)
+
+        # 读取原始关键点
+        fa_pts = read_points_from_txt(fa_pts_path)
+        cf_pts = read_points_from_txt(cf_pts_path)
+
+        if self.mode == 'fa2cf':
+            return img_fa, img_cf, fa_pts, cf_pts, fa_path, cf_path
+        else: # cf2fa
+            return img_cf, img_fa, cf_pts, fa_pts, cf_path, fa_path
